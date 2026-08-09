@@ -1,0 +1,8 @@
+# Optional: only needed for the offline BLIP captioning backend
+# (--caption-backend blip, the default whenever --generate-alt is used).
+# Not required for --caption-backend lmstudio or for plain conversion
+# without --generate-alt.
+#
+# Install with:
+#   conda run -n pdf2html python -m pip install -r requirements-blip.txt
+transformers>=4.40
