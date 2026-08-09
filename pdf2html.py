@@ -36,8 +36,9 @@ GARBLED_TEXT_MIN_LENGTH = 20
 # a running header/footer (chapter title, page number) rather than body text.
 MARGIN_ZONE_RATIO = 0.09
 MARGIN_TEXT_MAX_LEN = 70
-# OCR paragraphs that are mostly digits are almost always a mangled column of
-# page numbers (see module docstring / README) - flagged, not discarded.
+# OCR paragraphs that are mostly digits are almost always a residual mangled
+# fragment of a page-number column (see module docstring / README) - flagged,
+# not discarded.
 NUMERIC_PARAGRAPH_RATIO = 0.6
 NUMERIC_PARAGRAPH_MIN_CHARS = 4
 LMSTUDIO_DEFAULT_URL = "http://localhost:1234/v1"
@@ -47,6 +48,33 @@ LMSTUDIO_TIMEOUT = 120
 # collapse back into one word ("более"). Requires a letter on both sides so we
 # don't touch numeric ranges ("2020-2021") or list markers.
 HYPHEN_WRAP_RE = re.compile(r"(?<=[A-Za-zА-Яа-яЁё])-\s+(?=[A-Za-zА-Яа-яЁё])")
+
+# --- OCR layout reconstruction tuning ---
+# Two raw OCR detections are the same printed row if their y-ranges overlap
+# by at least this fraction (intersection / union of [y0,y1]) - NOT just
+# center proximity. A table-of-contents title and its far-off page number
+# (split apart by a sparse, undetected dot leader) sit almost exactly within
+# each other's height despite a huge horizontal gap, so they clear this bar.
+# Note this does NOT reliably separate two columns running in parallel at
+# the same height (e.g. a margin callout box laid out on the same baseline
+# grid as the main text overlaps just as much) - that ambiguity is why
+# callout boxes are found and OCR'd separately via find_callout_boxes()
+# instead of being told apart from text geometry alone.
+ROW_MIN_Y_OVERLAP_RATIO = 0.5
+# Two consecutive rows merge into one paragraph if the gap between them is
+# under this multiple of the page's median row height.
+PARAGRAPH_GAP_RATIO = 1.3
+# A trailing "<space><1-4 digits>" is treated as a page-number reference that
+# closes out a table-of-contents/index entry, so the next row always starts a
+# new paragraph instead of running on into it.
+TRAILING_PAGE_NUMBER_RE = re.compile(r"\s\d{1,4}[.,]?$")
+PARAGRAPH_TERMINATOR_CHARS = ".!?:;»)”"
+# A vector-graphics region (see find_callout_boxes) spanning most of the
+# page width is a full-width rule (e.g. a header underline), not a margin
+# callout box; anything smaller than this is noise, not a real box.
+CALLOUT_MAX_WIDTH_RATIO = 0.85
+CALLOUT_MIN_SIZE_PT = 20
+CALLOUT_IMAGE_OVERLAP_MAX_RATIO = 0.5
 
 _caption_model = None
 _caption_processor = None
@@ -67,7 +95,7 @@ def resolve_use_gpu(preference):
 
 def check_blip_available():
     """transformers is an optional dependency (see requirements-blip.txt) -
-    only needed for --caption-backend blip."""
+    only needed for --generate-alt blip."""
     try:
         import transformers  # noqa: F401
     except ImportError:
@@ -83,9 +111,9 @@ def get_captioner(use_gpu):
             from transformers import BlipForConditionalGeneration, BlipProcessor
         except ImportError:
             raise SystemExit(
-                "Пакет transformers не установлен (нужен для --caption-backend blip). "
+                "Пакет transformers не установлен (нужен для --generate-alt blip). "
                 "Поставьте: conda run -n pdf2html python -m pip install -r requirements-blip.txt "
-                "- либо используйте --caption-backend lmstudio или --no-generate-alt."
+                "- либо используйте --generate-alt lmstudio или --generate-alt off."
             )
 
         print(
@@ -216,41 +244,260 @@ def get_ocr_reader(use_gpu):
     return _ocr_reader
 
 
-def ocr_page_paragraphs(page, page_dict, use_gpu):
-    """Render a page to an image and OCR it, for PDFs whose text layer is broken.
+def vertical_overlap_ratio(a_y0, a_y1, b_y0, b_y1):
+    overlap = min(a_y1, b_y1) - max(a_y0, b_y0)
+    if overlap <= 0:
+        return 0.0
+    union = max(a_y1, b_y1) - min(a_y0, b_y0)
+    return overlap / union if union > 0 else 0.0
 
-    Embedded raster images are blanked out before OCR: they're already
-    extracted and captioned separately by render_image_block(), and leaving
-    them in would have OCR try to read on-screen UI chrome / photo content as
-    if it were the page's body text (e.g. a browser screenshot's menu bar).
 
-    Returns (paragraphs, page_height_px) where each paragraph is
-    {"text": str, "y0": float, "y1": float} in the same pixel space as
-    page_height_px, so callers can classify header/footer position.
+def cluster_rows(line_boxes):
+    """Merge raw OCR detections into visual rows by vertical (y-range)
+    OVERLAP rather than center proximity or a fixed gap.
+
+    This is what correctly reattaches a table-of-contents title to its page
+    number - "Title......." and "27" are split into two boxes because the
+    sparse, undotted dot leader between them isn't recognized as text, but
+    both boxes span almost the same y-range (the digits are shorter/smaller
+    but still sit within the title's height), so they overlap heavily
+    despite the huge horizontal gap. Two genuinely different lines at a
+    similar height - including two columns running in parallel, e.g. a
+    margin callout beside the main text - normally overlap only a little,
+    since their baselines/font sizes rarely align that closely; a plain
+    center+tolerance test can't tell these two situations apart nearly as
+    reliably as overlap does.
+    """
+    if not line_boxes:
+        return []
+    ordered = sorted(line_boxes, key=lambda b: (b["y0"] + b["y1"]) / 2)
+    rows = []
+    for box in ordered:
+        merged = False
+        for row in rows:
+            if vertical_overlap_ratio(box["y0"], box["y1"], row["y0"], row["y1"]) >= ROW_MIN_Y_OVERLAP_RATIO:
+                row["boxes"].append(box)
+                row["y0"] = min(row["y0"], box["y0"])
+                row["y1"] = max(row["y1"], box["y1"])
+                merged = True
+                break
+        if not merged:
+            rows.append({"y0": box["y0"], "y1": box["y1"], "boxes": [box]})
+
+    result = []
+    for row in rows:
+        boxes = sorted(row["boxes"], key=lambda b: b["x0"])
+        text = " ".join(b["text"] for b in boxes if b["text"].strip())
+        if not text.strip():
+            continue
+        result.append({
+            "x0": min(b["x0"] for b in boxes),
+            "x1": max(b["x1"] for b in boxes),
+            "y0": min(b["y0"] for b in boxes),
+            "y1": max(b["y1"] for b in boxes),
+            "text": text,
+        })
+    result.sort(key=lambda r: (r["y0"] + r["y1"]) / 2)
+    return result
+
+
+def find_callout_boxes(page, page_dict):
+    """Detect rectangular decorative regions (e.g. a margin callout/tip box)
+    from the page's own vector graphics (border lines/fills) - independent
+    of the (possibly broken) text layer, and far more reliable than trying
+    to infer columns from OCR text geometry: this book's callout boxes turn
+    out to share the SAME baseline grid as the main column, so a box's side
+    text can align almost exactly with a main-column line at the same
+    height, which defeats any purely position-based text heuristic.
+
+    A box's border is typically drawn as several separate thin line/fill
+    segments; segments that touch or nearly touch are merged into one
+    region. Returns a list of fitz.Rect, filtered to plausible partial-width
+    boxes - a full-width rect (e.g. a header underline) or a tiny stray mark
+    isn't a callout box - and with anything that's mostly a frame drawn
+    around an embedded image (e.g. a screenshot border) excluded, since
+    OCR'ing that region would just read the picture's own on-screen text as
+    if it were callout prose.
+    """
+    drawings = page.get_drawings()
+    page_width = page.rect.width
+    rects = [fitz.Rect(d["rect"]) for d in drawings if d.get("rect") is not None]
+    rects = [r for r in rects if r.width >= 0.5 or r.height >= 0.5]
+    if not rects:
+        return []
+
+    tolerance = 3
+    n = len(rects)
+    parent = list(range(n))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(i, j):
+        ri, rj = find(i), find(j)
+        if ri != rj:
+            parent[ri] = rj
+
+    for i in range(n):
+        a = rects[i]
+        expanded = fitz.Rect(a.x0 - tolerance, a.y0 - tolerance, a.x1 + tolerance, a.y1 + tolerance)
+        for j in range(i + 1, n):
+            if expanded.intersects(rects[j]):
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        root = find(i)
+        if root in groups:
+            groups[root] |= rects[i]
+        else:
+            groups[root] = fitz.Rect(rects[i])
+
+    image_rects = [fitz.Rect(b["bbox"]) for b in page_dict["blocks"] if b["type"] == 1]
+
+    boxes = []
+    for rect in groups.values():
+        if rect.width >= page_width * CALLOUT_MAX_WIDTH_RATIO:
+            continue
+        if rect.height < CALLOUT_MIN_SIZE_PT or rect.width < CALLOUT_MIN_SIZE_PT:
+            continue
+        box_area = rect.width * rect.height
+        is_image_frame = False
+        for img_rect in image_rects:
+            intersection = rect & img_rect
+            if intersection.is_empty:
+                continue
+            overlap_area = intersection.width * intersection.height
+            if box_area > 0 and overlap_area / box_area > CALLOUT_IMAGE_OVERLAP_MAX_RATIO:
+                is_image_frame = True
+                break
+        if is_image_frame:
+            continue
+        boxes.append(rect)
+    return boxes
+
+
+def reflow_rows_into_paragraphs(rows):
+    """Merge consecutive rows into paragraphs: close vertical spacing plus a
+    row whose text doesn't already "look finished" (no terminal punctuation,
+    no trailing page number) continues the paragraph; otherwise a new one
+    starts. The trailing-page-number check is what keeps table-of-contents
+    entries as separate one-line paragraphs instead of one giant run-on
+    block, even though they're single-spaced like a normal paragraph.
+    """
+    if not rows:
+        return []
+    heights = [r["y1"] - r["y0"] for r in rows] or [10]
+    median_height = sorted(heights)[len(heights) // 2] or 10
+    gap_threshold = median_height * PARAGRAPH_GAP_RATIO
+
+    paragraphs = []
+    current_text = rows[0]["text"]
+    current = dict(rows[0])
+    for row in rows[1:]:
+        gap = row["y0"] - current["y1"]
+        prev_text = current_text.rstrip()
+        prev_finished = (
+            not prev_text
+            or prev_text[-1] in PARAGRAPH_TERMINATOR_CHARS
+            or TRAILING_PAGE_NUMBER_RE.search(prev_text) is not None
+        )
+        if gap <= gap_threshold and not prev_finished:
+            current_text = prev_text + " " + row["text"]
+            current["y1"] = row["y1"]
+            current["x1"] = max(current["x1"], row["x1"])
+        else:
+            paragraphs.append({**current, "text": current_text})
+            current_text = row["text"]
+            current = dict(row)
+    paragraphs.append({**current, "text": current_text})
+    return paragraphs
+
+
+def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0):
+    """OCR an already-rendered (and already-masked, if relevant) region
+    image and return reflowed paragraphs. offset_x/offset_y translate a
+    cropped sub-image's local coordinates back into full-page pixel space,
+    so a callout box's paragraphs are directly comparable (e.g. for
+    header/footer classification) to the main flow's.
     """
     import numpy as np
+
+    raw_results = reader.readtext(np.array(image), detail=1, paragraph=False)
+    line_boxes = []
+    for bbox, text, _confidence in raw_results:
+        text = text.strip()
+        if not text:
+            continue
+        xs = [point[0] for point in bbox]
+        ys = [point[1] for point in bbox]
+        line_boxes.append({
+            "x0": min(xs) + offset_x, "x1": max(xs) + offset_x,
+            "y0": min(ys) + offset_y, "y1": max(ys) + offset_y,
+            "text": text,
+        })
+
+    rows = cluster_rows(line_boxes)
+    paragraphs = []
+    for para in reflow_rows_into_paragraphs(rows):
+        text = clean_text(para["text"])
+        if not text.strip():
+            continue
+        paragraphs.append({"text": text, "y0": para["y0"], "y1": para["y1"]})
+    return paragraphs
+
+
+def ocr_page_regions(page, page_dict, use_gpu):
+    """Render a page to an image and OCR it, for PDFs whose text layer is
+    broken, reconstructing rows/paragraphs from the raw detections (see
+    cluster_rows/reflow_rows_into_paragraphs).
+
+    Embedded raster images AND any detected callout boxes (find_callout_
+    boxes) are blanked out of the MAIN pass and OCR'd separately instead:
+    images are already extracted/captioned by render_image_block(), and a
+    callout box's text needs its own isolated OCR pass rather than being
+    read together with the main column - see find_callout_boxes() for why
+    that matters on this book's layout. Leaving either in the main pass
+    would have OCR read on-screen UI chrome / a sidebar's unrelated text as
+    if it were body text.
+
+    Returns (paragraphs, page_height_px) where each paragraph is
+    {"text": str, "y0": float, "y1": float, "region": int} in the same pixel
+    space as page_height_px (for header/footer position classification).
+    region 0 is the main flow; region >= 1 is a callout box.
+    """
     from PIL import Image, ImageDraw
 
     reader = get_ocr_reader(use_gpu)
-    pixmap = page.get_pixmap(dpi=OCR_RENDER_DPI)
-    image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
-
     scale = OCR_RENDER_DPI / 72.0
-    draw = ImageDraw.Draw(image)
+    callout_boxes = find_callout_boxes(page, page_dict)
+
+    pixmap = page.get_pixmap(dpi=OCR_RENDER_DPI)
+    main_image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
+    draw = ImageDraw.Draw(main_image)
     for block in page_dict["blocks"]:
         if block["type"] == 1:
             x0, y0, x1, y1 = block["bbox"]
             draw.rectangle([x0 * scale, y0 * scale, x1 * scale, y1 * scale], fill="white")
+    for box in callout_boxes:
+        draw.rectangle([box.x0 * scale, box.y0 * scale, box.x1 * scale, box.y1 * scale], fill="white")
 
-    raw_results = reader.readtext(np.array(image), detail=1, paragraph=True)
     paragraphs = []
-    for bbox, text in raw_results:
-        text = clean_text(text)
-        if not text.strip():
-            continue
-        ys = [point[1] for point in bbox]
-        paragraphs.append({"text": text, "y0": min(ys), "y1": max(ys)})
-    return paragraphs, image.height
+    for para in ocr_region_paragraphs(reader, main_image):
+        para["region"] = 0
+        paragraphs.append(para)
+
+    for box in callout_boxes:
+        clip_pixmap = page.get_pixmap(clip=box, dpi=OCR_RENDER_DPI)
+        clip_image = Image.open(io.BytesIO(clip_pixmap.tobytes("png"))).convert("RGB")
+        for para in ocr_region_paragraphs(reader, clip_image, box.x0 * scale, box.y0 * scale):
+            para["region"] = 1
+            paragraphs.append(para)
+
+    return paragraphs, main_image.height
 
 
 def is_text_garbled(raw_text_blocks):
@@ -343,6 +590,8 @@ def build_html_document(title, body_html):
         ".page-meta{font-size:0.8em;color:#999;margin:0 0 0.9em;"
         "text-transform:uppercase;letter-spacing:0.03em}",
         ".ocr-numbers{color:#aaa;font-style:italic;font-size:0.85em}",
+        ".callout{border-left:3px solid #ccc;margin:1.2rem 0;padding:0.1rem 1rem;"
+        "background:#fafafa;font-size:0.95em;color:#444}",
         "</style>",
         "</head>",
         "<body>",
@@ -391,6 +640,7 @@ def render_page(page, page_dict, page_number, images_dir, save_images, generate_
 
     body_items = []
     margin_items = []
+    callout_items = []
     image_index = 0
 
     if use_ocr:
@@ -399,13 +649,18 @@ def render_page(page, page_dict, page_number, images_dir, save_images, generate_
             "распознаю текст через OCR...",
             file=sys.stderr,
         )
-        paragraphs, page_height_px = ocr_page_paragraphs(page, page_dict, use_gpu)
+        paragraphs, page_height_px = ocr_page_regions(page, page_dict, use_gpu)
         for para in paragraphs:
             text = para["text"]
             if not text.strip():
                 continue
             if is_margin_text(para["y0"], para["y1"], page_height_px, text):
                 margin_items.append(text)
+            elif para["region"] > 0:
+                # A separate column (e.g. a margin callout box) running
+                # alongside the main flow - kept intact as its own block
+                # instead of interleaved line-by-line into the main text.
+                callout_items.append(text)
             elif is_numeric_heavy(text):
                 body_items.append(f'<p class="ocr-numbers">{escape(text)}</p>')
             else:
@@ -431,6 +686,11 @@ def render_page(page, page_dict, page_number, images_dir, save_images, generate_
                 generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
             ))
 
+    if callout_items:
+        body_items.append('<aside class="callout">')
+        body_items.extend(f"<p>{escape(text)}</p>" for text in callout_items)
+        body_items.append("</aside>")
+
     parts = [f'<section class="page" id="page-{page_number}">']
     if margin_items:
         parts.append(f'<p class="page-meta">{escape(" · ".join(margin_items))}</p>')
@@ -443,37 +703,55 @@ def state_dir_for(output_dir, pdf_path):
     return output_dir / f".{pdf_path.stem}.pdf2html-state"
 
 
-def load_or_init_state(state_dir, run_meta, restart):
+def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start_page, end_page):
     """Set up (or validate/resume) the per-page checkpoint directory.
 
-    Compatibility is keyed on the source PDF's identity plus the flags that
-    change fragment *content* (save_images, generate_alt) - not on the page
-    range, so a user can convert a book in several chunks (e.g. 1-100, then
-    101-end) across separate invocations and still get one assembled file.
+    Only the source PDF's *identity* (path/size/mtime) is a hard gate - mixing
+    fragments from two different documents would be silent data corruption.
+    --save-images/--generate-alt are allowed to change between invocations
+    (that's how you convert a book in chunks with different settings per
+    chunk, or add captions to a later range); a mismatch there just prints an
+    informational note, since already-written fragments simply keep whatever
+    format they were made with.
     """
     meta_path = state_dir / "meta.json"
     pages_dir = state_dir / "pages"
-
-    if restart and state_dir.exists():
-        shutil.rmtree(state_dir)
+    pages_dir.mkdir(parents=True, exist_ok=True)
 
     if meta_path.exists():
         try:
-            existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
-            existing_meta = None
-        if existing_meta != run_meta:
+            meta = None
+        if not meta or meta.get("identity") != pdf_identity:
             raise SystemExit(
-                "Найдено состояние предыдущего (незавершённого) запуска с "
-                "другим PDF-файлом или другими параметрами --save-images/"
-                "--generate-alt. Запустите с --restart, чтобы начать заново, "
-                "либо укажите другую папку -o."
+                f"Папка состояния {state_dir.name} относится к другому PDF-файлу "
+                "(другой путь, размер или дата изменения). Укажите другую папку "
+                "-o для этого документа."
             )
-    else:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        meta_path.write_text(json.dumps(run_meta, ensure_ascii=False, indent=2), encoding="utf-8")
+        previous_settings = meta.get("last_settings")
+        if previous_settings and previous_settings != current_settings:
+            print(
+                "Обратите внимание: --save-images/--generate-alt отличаются от "
+                f"предыдущего запуска (было: {previous_settings}, сейчас: "
+                f"{current_settings}). Уже готовые страницы сохранят прежний "
+                "формат - новыми настройками будут обработаны только страницы, "
+                "которых ещё нет в кеше. Чтобы пересчитать уже готовые страницы "
+                "текущего диапазона новыми настройками, используйте --restart.",
+                file=sys.stderr,
+            )
 
-    pages_dir.mkdir(parents=True, exist_ok=True)
+    if restart:
+        for page_number in range(start_page, end_page + 1):
+            fragment_path = pages_dir / f"{page_number:04d}.html"
+            if fragment_path.exists():
+                fragment_path.unlink()
+
+    meta_path.write_text(
+        json.dumps({"identity": pdf_identity, "last_settings": current_settings},
+                   ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     return pages_dir
 
 
@@ -503,7 +781,7 @@ def assemble_output(out_file, title, fragments):
 
 
 def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
-                 start_page=1, end_page=None, restart=False,
+                 start_page=1, end_page=None, restart=False, clean_state=False,
                  caption_backend="blip", use_gpu=None,
                  lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
     output_dir = Path(output_dir)
@@ -528,15 +806,14 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
     title = clean_text(doc.metadata.get("title") or "") or pdf_path.stem
 
     stat = pdf_path.stat()
-    run_meta = {
+    pdf_identity = {
         "pdf_path": str(pdf_path.resolve()),
         "pdf_size": stat.st_size,
         "pdf_mtime": stat.st_mtime,
-        "save_images": save_images,
-        "generate_alt": generate_alt,
     }
+    current_settings = {"save_images": save_images, "generate_alt": generate_alt}
     state_dir = state_dir_for(output_dir, pdf_path)
-    pages_dir = load_or_init_state(state_dir, run_meta, restart)
+    pages_dir = load_or_init_state(state_dir, pdf_identity, current_settings, restart, start_page, end_page)
     fragments = read_existing_fragments(pages_dir, page_count)
 
     already_done = sum(1 for n in range(start_page, end_page + 1) if n in fragments)
@@ -569,6 +846,20 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
         print(f"Обработана страница {page_number}/{page_count}", file=sys.stderr)
 
     doc.close()
+
+    if clean_state:
+        done_count = sum(1 for n in range(1, page_count + 1) if n in fragments)
+        if done_count == page_count:
+            shutil.rmtree(state_dir, ignore_errors=True)
+            print("Документ сконвертирован полностью - служебная папка состояния удалена.", file=sys.stderr)
+        else:
+            print(
+                f"--clean-state: документ ещё не сконвертирован полностью "
+                f"({done_count}/{page_count} стр.) - папка состояния сохранена "
+                "для последующего продолжения.",
+                file=sys.stderr,
+            )
+
     return out_file
 
 
@@ -591,12 +882,13 @@ def parse_args(argv=None):
         help="Не сохранять картинки - вместо <img> вставляется текстовое описание/заглушка",
     )
     parser.add_argument(
-        "--generate-alt", dest="generate_alt", action="store_true", default=False,
-        help="Генерировать описание картинки для alt/текста-заглушки (по умолчанию: выключено, самый быстрый режим)",
-    )
-    parser.add_argument(
-        "--no-generate-alt", dest="generate_alt", action="store_false",
-        help="Не генерировать описания картинок (по умолчанию)",
+        "--generate-alt", choices=["off", "blip", "lmstudio"], default="off",
+        help=(
+            "Описание картинок для alt/текста-заглушки: off - не генерировать "
+            "(по умолчанию, самый быстрый режим, ничего лишнего не ставится/не "
+            "запускается), blip - офлайн-модель (требует requirements-blip.txt), "
+            "lmstudio - локальный сервер LM Studio"
+        ),
     )
     parser.add_argument(
         "--start-page", type=int, default=1,
@@ -611,6 +903,14 @@ def parse_args(argv=None):
         help="Игнорировать состояние предыдущего прерванного запуска и начать заново",
     )
     parser.add_argument(
+        "--clean-state", action="store_true",
+        help=(
+            "Удалить служебную папку с промежуточными фрагментами страниц, когда "
+            "весь документ (а не только запрошенный диапазон) окажется полностью "
+            "сконвертирован"
+        ),
+    )
+    parser.add_argument(
         "--gpu", dest="use_gpu", action="store_true", default=None,
         help="Принудительно использовать GPU (CUDA) для OCR и подписей к картинкам",
     )
@@ -619,16 +919,15 @@ def parse_args(argv=None):
         help="Принудительно использовать CPU (по умолчанию: автоопределение через torch.cuda)",
     )
     parser.add_argument(
-        "--caption-backend", choices=["blip", "lmstudio"], default="blip",
-        help="Движок описания картинок: офлайн BLIP (по умолчанию) или локальный сервер LM Studio",
-    )
-    parser.add_argument(
         "--lmstudio-url", default=LMSTUDIO_DEFAULT_URL,
         help=f"Базовый URL OpenAI-совместимого сервера LM Studio (по умолчанию: {LMSTUDIO_DEFAULT_URL})",
     )
     parser.add_argument(
-        "--lmstudio-model", default=None,
-        help="Имя загруженной в LM Studio vision-модели (обязательно при --caption-backend lmstudio)",
+        "--lmstudio-model", default="lfm2.5-vl-450m",
+        help=(
+            "Имя загруженной в LM Studio vision-модели, используется при "
+            "--generate-alt lmstudio (по умолчанию: %(default)s - см. README)"
+        ),
     )
     return parser.parse_args(argv)
 
@@ -640,16 +939,19 @@ def main(argv=None):
         print(f"Ошибка: файл не найден: {pdf_path}", file=sys.stderr)
         return 1
 
-    if args.generate_alt and args.caption_backend == "blip" and not check_blip_available():
+    generate_alt = args.generate_alt != "off"
+    caption_backend = args.generate_alt if generate_alt else "blip"
+
+    if generate_alt and caption_backend == "blip" and not check_blip_available():
         print(
-            "Ошибка: пакет transformers не установлен (нужен для --caption-backend blip, "
-            "используемого по умолчанию). Поставьте: conda run -n pdf2html python -m pip "
-            "install -r requirements-blip.txt - либо используйте --caption-backend lmstudio.",
+            "Ошибка: пакет transformers не установлен (нужен для --generate-alt blip). "
+            "Поставьте: conda run -n pdf2html python -m pip install -r requirements-blip.txt "
+            "- либо используйте --generate-alt lmstudio.",
             file=sys.stderr,
         )
         return 1
 
-    if args.caption_backend == "lmstudio" and args.generate_alt:
+    if generate_alt and caption_backend == "lmstudio":
         ok, message = check_lmstudio(args.lmstudio_url, args.lmstudio_model)
         if not ok:
             print(f"Ошибка: {message}", file=sys.stderr)
@@ -659,11 +961,12 @@ def main(argv=None):
         pdf_path,
         args.output_dir,
         save_images=args.save_images,
-        generate_alt=args.generate_alt,
+        generate_alt=generate_alt,
         start_page=args.start_page,
         end_page=args.end_page,
         restart=args.restart,
-        caption_backend=args.caption_backend,
+        clean_state=args.clean_state,
+        caption_backend=caption_backend,
         use_gpu=args.use_gpu,
         lmstudio_url=args.lmstudio_url,
         lmstudio_model=args.lmstudio_model,
