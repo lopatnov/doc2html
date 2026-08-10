@@ -1,3 +1,8 @@
+/input
+/output
+__pycache__/
+*.log
+/scratchpad*.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
