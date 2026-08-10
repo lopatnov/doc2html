@@ -99,6 +99,68 @@ def _(page_data):
         "колонки на странице 28 не определились - проверь detect_column_boundary_x (узкий gutter ~11pt)"
 
 
+@check(KONOVALENKO, 16, "сноска не теряется в margin - остаётся содержимым страницы")
+def _(page_data):
+    assert not any("Його також можна завантажити" in m for m in page_data.get("margin", [])), \
+        "сноска попала в margin - проверь collect_superscript_digit_markers/FOOTNOTE_MARKER_RE"
+    assert any("Його також можна завантажити" in b.get("text", "") for b in page_data["blocks"]), \
+        "текст сноски не найден среди блоков страницы"
+
+
+@check(KONOVALENKO, 10, "маркер сноски получает <sup> через runs")
+def _(page_data):
+    superscript_runs = [
+        run for b in page_data["blocks"] if b["type"] == "p" and b.get("runs")
+        for run in b["runs"] if run.get("superscript")
+    ]
+    assert superscript_runs, "ни один run не помечен superscript - проверь flags&1 в extract_block_runs"
+
+
+@check(INPUT_DIR / "Non-Designers-Design-Book.pdf", 4,
+       "реальные PDF-ссылки (внешний URL и mailto:) сохраняются, а не отбрасываются молча")
+def _(page_data):
+    hrefs = [
+        run.get("href")
+        for b in page_data["blocks"] if b["type"] == "p" and b.get("runs")
+        for run in b["runs"] if run.get("href")
+    ]
+    assert any("peachpit.com" in h.lower() for h in hrefs), \
+        f"внешняя ссылка на peachpit.com не найдена среди {hrefs!r} - проверь find_page_links/_span_href"
+    assert any(h.startswith("mailto:") for h in hrefs), \
+        f"mailto: ссылка не найдена среди {hrefs!r}"
+
+
+@check(KONOVALENKO, 24, "курсив внутри абзаца ('налагоджувачем') сохраняется, а не отбрасывается")
+def _(page_data):
+    p_blocks = [b for b in page_data["blocks"] if b["type"] == "p"]
+    runs_blocks = [b for b in p_blocks if b.get("runs")]
+    assert runs_blocks, "ни один абзац не получил 'runs' - проверь block_emphasis_runs"
+    assert any(
+        any(run["italic"] and "налагоджувачем" in run["text"] for run in b["runs"])
+        for b in runs_blocks
+    ), "курсивный run с 'налагоджувачем' не найден - проверь extract_block_runs"
+
+
+@check(INPUT_DIR / "Non-Designers-Design-Book.pdf", 284,
+       "нумерованный список, слипшийся в один PDF-блок, разбивается на отдельные li")
+def _(page_data):
+    items = [b for b in page_data["blocks"] if b["type"] == "li"]
+    assert len(items) == 7, f"ожидал 7 пунктов списка на странице 284, нашёл {len(items)}"
+    assert all(b.get("ordered") for b in items), "все пункты должны быть нумерованными (ordered=True)"
+
+
+@check(KONOVALENKO, 90, "код в листинге распознаётся как блок кода с сохранением отступов, не как таблица")
+def _(page_data):
+    code_blocks = [b for b in page_data["blocks"] if b["type"] == "code"]
+    assert len(code_blocks) == 1, f"ожидал 1 блок кода на странице 90, нашёл {len(code_blocks)}"
+    assert not any(b["type"] == "table" for b in page_data["blocks"]), \
+        "листинг с колонкой номеров строк не должен ошибочно распознаваться как таблица - проверь _table_region_is_actually_code"
+    text = code_blocks[0]["text"]
+    assert "    student.Name" in text, \
+        "отступ перед 'student.Name' потерян - проверь extract_block_code_raw_text (не должен .strip() строки)"
+    assert "\n" in text, "код должен сохранять переносы строк, а не склеиваться в одну строку"
+
+
 @check(KONOVALENKO, 44, "таблица типов C# распознаётся как настоящая таблица, а не россыпь абзацев")
 def _(page_data):
     tables = [b for b in page_data["blocks"] if b["type"] == "table"]

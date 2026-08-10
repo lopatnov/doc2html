@@ -99,6 +99,17 @@ COLUMN_SIBLING_MATCH_MIN_RATIO = 0.5
 CALLOUT_MAX_WIDTH_RATIO = 0.85
 CALLOUT_MIN_SIZE_PT = 20
 CALLOUT_IMAGE_OVERLAP_MAX_RATIO = 0.5
+# extract_page_blocks() (non-OCR path only - see find_page_tables): a text
+# block counts as "consumed by" a detected table when this much of its own
+# area sits inside the table's bbox, so it's rendered once as part of the
+# table instead of also appearing as a separate, duplicated paragraph.
+TABLE_BLOCK_OVERLAP_MIN_RATIO = 0.5
+# page.find_tables() often over-segments into spurious all-empty columns
+# and turns a wrapped multi-line cell into an extra almost-empty row - a
+# detected table is only trusted once cleaned down to at least this many
+# real columns and rows (see clean_table_rows).
+TABLE_MIN_COLUMNS = 2
+TABLE_MIN_ROWS = 2
 
 # --- Heading detection tuning ---
 # A text block/paragraph is promoted to a heading if its dominant font size
@@ -514,6 +525,30 @@ def find_callout_boxes(page, page_dict):
 
 LEADING_PAGE_NUMBER_RE = re.compile(r"^\d{1,4}\s")
 
+# Real bullet glyphs seen across sampled books (► is common in Cyrillic
+# technical books; the others are the usual Unicode bullet family) - a
+# bare "-"/"*" is deliberately excluded, since those are far too likely to
+# be an ordinary hyphen/em-dash-like usage or a code comment marker rather
+# than a genuine list item.
+LIST_BULLET_CHARS = "►•‣▪●○◦"
+LIST_BULLET_RE = re.compile(rf"^([{re.escape(LIST_BULLET_CHARS)}])\s+(\S.*)$")
+# A numbered list marker needs '.'/')' right after the digit(s) plus real
+# content after that - "28 Chapter Name" (TOC-style, no punctuation) is a
+# different pattern already handled by LEADING_PAGE_NUMBER_RE elsewhere.
+LIST_NUMBER_RE = re.compile(r"^(\d{1,2})[.)]\s+(\S.*)$")
+
+
+def strip_list_marker(text):
+    """(item_text_without_marker, ordered) if text opens with a bullet or
+    numbered-list marker, else None."""
+    match = LIST_BULLET_RE.match(text)
+    if match:
+        return match.group(2), False
+    match = LIST_NUMBER_RE.match(text)
+    if match:
+        return match.group(2), True
+    return None
+
 
 def _finalize_ocr_paragraph(current, text, row_count, median_height):
     """A paragraph that never merged with a neighboring row (row_count == 1)
@@ -594,7 +629,10 @@ def reflow_rows_into_paragraphs(rows):
             or TRAILING_PAGE_NUMBER_RE.search(prev_text) is not None
             or prev_looks_like_heading
         )
-        next_starts_new_entry = bool(LEADING_PAGE_NUMBER_RE.match(row["text"]))
+        next_starts_new_entry = (
+            bool(LEADING_PAGE_NUMBER_RE.match(row["text"]))
+            or strip_list_marker(row["text"]) is not None
+        )
         if gap <= gap_threshold and not prev_finished and not next_starts_new_entry:
             current_text = prev_text + " " + row["text"]
             current["y1"] = row["y1"]
@@ -755,6 +793,32 @@ def is_margin_text(y0, y1, page_height, text):
     return is_in_margin_zone(y0, y1, page_height)
 
 
+FOOTNOTE_MARKER_RE = re.compile(r"^(\d{1,2})\s+\S")
+
+
+def collect_superscript_digit_markers(page_dict):
+    """Digit strings that appear as a genuine superscript span (flags&1)
+    somewhere on the page - a footnote at the bottom of the page starts
+    with its own reference number restated in normal size, and that
+    number matching one of these is what tells it apart from an ordinary
+    running footer/page number: is_margin_text()'s generic "short text
+    near the edge" heuristic alone can't (a short footnote and a running
+    footer look geometrically identical to it), and mistaking one for the
+    other silently drops the footnote's content into page metadata (see
+    extract_page_blocks)."""
+    markers = set()
+    for block in page_dict["blocks"]:
+        if block["type"] != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if span.get("flags", 0) & 1:
+                    text = span.get("text", "").strip()
+                    if text.isdigit():
+                        markers.add(text)
+    return markers
+
+
 def _blocks_run_in_parallel(left, right):
     """The real signature of two columns running side by side is that most
     blocks on one side sit at the same height as SOME block on the other
@@ -911,6 +975,142 @@ def extract_block_text(block):
     return clean_text(extract_block_raw_text(block))
 
 
+def _span_href(span, link_rects):
+    """The href of whichever link (see find_page_links) this span's own
+    bbox mostly sits inside, or None - a link's "from" rect is normally
+    sized to cover exactly the linked text, so most-of-the-span-inside is
+    a reliable match without needing exact bbox equality."""
+    if not link_rects:
+        return None
+    bbox = span.get("bbox")
+    if not bbox:
+        return None
+    span_rect = pymupdf.Rect(bbox)
+    span_area = span_rect.width * span_rect.height
+    if span_area <= 0:
+        return None
+    for rect, href in link_rects:
+        overlap = span_rect & rect
+        if overlap.is_empty:
+            continue
+        if (overlap.width * overlap.height) / span_area > 0.5:
+            return href
+    return None
+
+
+def extract_block_runs(block, link_rects=None):
+    """Per-span (text, bold, italic, href) runs for a block, adjacent runs
+    of identical style+link merged - mirrors extract_block_raw_text's line
+    filtering/joining exactly (same non-blank lines, same " " between
+    them) so the concatenation of these runs' text matches extract_block_
+    text()'s plain string, just with style/link info preserved alongside
+    instead of discarded. link_rects (see find_page_links) is optional -
+    without it every run's href is None."""
+    kept_lines = [
+        line for line in block.get("lines", [])
+        if "".join(s.get("text", "") for s in line.get("spans", [])).strip()
+    ]
+    raw_runs = []
+    for i, line in enumerate(kept_lines):
+        if i > 0:
+            raw_runs.append([" ", False, False, False, None])
+        for span in line.get("spans", []):
+            text = span.get("text", "")
+            if not text:
+                continue
+            flags = span.get("flags", 0)
+            href = _span_href(span, link_rects)
+            raw_runs.append([text, bool(flags & 2 ** 4), bool(flags & 2), bool(flags & 1), href])
+
+    merged = []
+    for text, bold, italic, superscript, href in raw_runs:
+        if (
+            merged
+            and merged[-1][1] == bold
+            and merged[-1][2] == italic
+            and merged[-1][3] == superscript
+            and merged[-1][4] == href
+        ):
+            merged[-1][0] += text
+        else:
+            merged.append([text, bold, italic, superscript, href])
+    return merged
+
+
+def block_emphasis_runs(block, link_rects=None):
+    """None for a uniformly-plain, unlinked block (the common case - not
+    worth the extra JSON/render-time work), or a list of {"text", "bold",
+    "italic", "superscript", "href"} runs when the block genuinely mixes/
+    contains bold/italic/superscript spans or overlaps a real PDF link -
+    each run's text cleaned the same way clean_code_text() cleans a code
+    line (NFKC + strip PUA/control), skipping HYPHEN_WRAP_RE since a
+    hyphen at a style-run boundary is rare and unwrapping across runs
+    would need cross-run lookahead this function deliberately doesn't do.
+    """
+    runs = extract_block_runs(block, link_rects)
+    if not any(bold or italic or superscript or href for _, bold, italic, superscript, href in runs):
+        return None
+    cleaned = [
+        {"text": clean_code_text(text), "bold": bold, "italic": italic, "superscript": superscript, "href": href}
+        for text, bold, italic, superscript, href in runs
+    ]
+    return [r for r in cleaned if r["text"]]
+
+
+LISTING_CAPTION_RE = re.compile(r"^(?:Лістинг|Листинг)\s+\d")
+MONOSPACE_FONT_HINTS = ("courier", "consolas", "mono", "menlo", "cascadia", "roboto mono")
+
+
+def clean_code_text(text):
+    """Like clean_text(), but for a code block: preserves newlines/leading
+    whitespace (indentation IS the content) and skips HYPHEN_WRAP_RE - a
+    stray "-\\n" in code is far more likely a real hyphen/operator at a
+    line break than a hyphenated word wrap, and rejoining it would corrupt
+    the code."""
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", text)
+    return "".join(
+        ch for ch in text
+        if not (0xE000 <= ord(ch) <= 0xF8FF)
+        and not (ord(ch) < 0x20 and ch not in "\n\t")
+    )
+
+
+def extract_block_code_raw_text(block):
+    """Like extract_block_raw_text(), but joins lines with '\\n' instead of
+    a single space and never strips a line - a prose block's line breaks
+    are just wrapping and don't matter, but in code they (and the leading
+    whitespace PyMuPDF preserves as literal space characters) are the
+    difference between readable code and a useless run-on string."""
+    return "\n".join(
+        "".join(span.get("text", "") for span in line.get("spans", []))
+        for line in block.get("lines", [])
+    )
+
+
+def dominant_font_name(block):
+    """Character-weighted most common font name across a block's spans -
+    used to recognize a monospace-flagged code listing (see
+    MONOSPACE_FONT_HINTS)."""
+    counts = {}
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            text = span.get("text", "")
+            if not text.strip():
+                continue
+            name = span.get("font", "")
+            counts[name] = counts.get(name, 0) + len(text)
+    if not counts:
+        return ""
+    return max(counts.items(), key=lambda item: item[1])[0]
+
+
+def is_monospace_font_name(name):
+    lowered = (name or "").lower()
+    return any(hint in lowered for hint in MONOSPACE_FONT_HINTS)
+
+
 def block_font_stats(block):
     """Character-weighted average font size and bold fraction for a text
     block's spans - a block usually has one dominant size/weight, but
@@ -1014,13 +1214,77 @@ def dedup_running_heads(ordered_pages):
     return ordered_pages
 
 
+# A URL that's visible as plain text but has no PDF link object behind it
+# (common when a document was scanned/OCR'd, or the source just didn't
+# bother making it clickable) - matched at RENDER time from whatever text
+# each path already extracted, so it works identically for both the clean
+# text-layer path (page.get_links() catches most but not all real links -
+# see find_page_links) and the OCR fallback path (no PDF link objects
+# survive a broken text layer, but the URL text itself often does).
+BARE_URL_RE = re.compile(r"(https?://[^\s<>\"'«»]+|www\.[^\s<>\"'«»]+\.[a-zA-Z]{2,}[^\s<>\"'«»]*)")
+
+
+def _linkify_url_target(matched):
+    url = matched.rstrip(").,;:!?»")
+    trailing = matched[len(url):]
+    href = url if url.startswith("http") else f"https://{url}"
+    return url, href, trailing
+
+
+def linkify_html(text):
+    parts = []
+    pos = 0
+    for m in BARE_URL_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(escape(text[pos:m.start()]))
+        url, href, trailing = _linkify_url_target(m.group(0))
+        parts.append(f'<a href="{escape(href)}">{escape(url)}</a>{escape(trailing)}')
+        pos = m.end()
+    parts.append(escape(text[pos:]))
+    return "".join(parts)
+
+
+def linkify_markdown(text):
+    parts = []
+    pos = 0
+    for m in BARE_URL_RE.finditer(text):
+        if m.start() > pos:
+            parts.append(escape_markdown_inline(text[pos:m.start()]))
+        url, href, trailing = _linkify_url_target(m.group(0))
+        parts.append(f"[{url}]({href})")
+        parts.append(escape_markdown_inline(trailing))
+        pos = m.end()
+    parts.append(escape_markdown_inline(text[pos:]))
+    return escape_markdown_leading_guard("".join(parts))
+
+
+def render_runs_html(runs):
+    parts = []
+    for run in runs:
+        text = escape(run["text"])
+        if run["bold"] and run["italic"]:
+            text = f"<strong><em>{text}</em></strong>"
+        elif run["bold"]:
+            text = f"<strong>{text}</strong>"
+        elif run["italic"]:
+            text = f"<em>{text}</em>"
+        if run.get("superscript"):
+            text = f"<sup>{text}</sup>"
+        href = run.get("href")
+        if href:
+            text = f'<a href="{escape(href)}">{text}</a>'
+        parts.append(text)
+    return "".join(parts)
+
+
 def render_block_html(block):
     block_type = block["type"]
     if block_type in ("p", "p_numeric"):
         css_class = "ocr-numbers" if block_type == "p_numeric" else None
         style = f' style="margin-left:{block["indent_em"]}em"' if block.get("indent_em") else ""
         class_attr = f' class="{css_class}"' if css_class else ""
-        return f"<p{class_attr}{style}>{escape(block['text'])}</p>"
+        inner = render_runs_html(block["runs"]) if block.get("runs") else linkify_html(block["text"])
+        return f"<p{class_attr}{style}>{inner}</p>"
     if block_type == "h":
         level = block["level"]
         return f"<h{level}>{escape(block['text'])}</h{level}>"
@@ -1030,7 +1294,50 @@ def render_block_html(block):
         if block["caption"]:
             return f'<p class="image-placeholder">[Изображение: {escape(block["caption"])}]</p>'
         return '<p class="image-placeholder">[Изображение]</p>'
+    if block_type == "table":
+        header, *body = block["rows"]
+        parts = ["<table>", "<tr>" + "".join(f"<th>{escape(c)}</th>" for c in header) + "</tr>"]
+        for row in body:
+            parts.append("<tr>" + "".join(f"<td>{escape(c)}</td>" for c in row) + "</tr>")
+        parts.append("</table>")
+        return "\n".join(parts)
+    if block_type == "code":
+        return f"<pre><code>{escape(block['text'])}</code></pre>"
+    if block_type == "li":
+        # Standalone fallback (a lone list item with no neighbors) - the
+        # normal path for consecutive items is render_flow_html, which
+        # groups them into one shared <ul>/<ol> so ordered numbering
+        # doesn't restart at every single item.
+        tag = "ol" if block.get("ordered") else "ul"
+        return f"<{tag}><li>{linkify_html(block['text'])}</li></{tag}>"
     raise ValueError(f"unknown block type: {block_type}")
+
+
+def render_flow_html(blocks):
+    """Render a flat block list to HTML parts, grouping any run of
+    consecutive "li" blocks (same ordered/unordered kind) into one shared
+    <ul>/<ol> - rendering each item independently would restart an ordered
+    list's numbering at "1." every time instead of counting up."""
+    parts = []
+    i, n = 0, len(blocks)
+    while i < n:
+        block = blocks[i]
+        if block["type"] == "li":
+            ordered = block.get("ordered", False)
+            j = i
+            items = []
+            while j < n and blocks[j]["type"] == "li" and blocks[j].get("ordered", False) == ordered:
+                items.append(blocks[j])
+                j += 1
+            tag = "ol" if ordered else "ul"
+            parts.append(f"<{tag}>")
+            parts.extend(f"<li>{linkify_html(item['text'])}</li>" for item in items)
+            parts.append(f"</{tag}>")
+            i = j
+        else:
+            parts.append(render_block_html(block))
+            i += 1
+    return parts
 
 
 def group_blocks_for_layout(blocks):
@@ -1072,12 +1379,12 @@ def render_page_html(page_data):
         parts.append(f'<p class="page-meta">{escape(" · ".join(margin))}</p>')
     for kind, payload in group_blocks_for_layout(page_data["blocks"]):
         if kind == "flow":
-            parts.extend(render_block_html(b) for b in payload)
+            parts.extend(render_flow_html(payload))
         else:
             parts.append('<div class="cols">')
             for col_index in sorted(payload):
                 parts.append('<div class="col">')
-                parts.extend(render_block_html(b) for b in payload[col_index])
+                parts.extend(render_flow_html(payload[col_index]))
                 parts.append("</div>")
             parts.append("</div>")
     if page_data["callout"]:
@@ -1110,6 +1417,14 @@ def build_html_document(title, body_html):
         ".cols{display:flex;gap:2rem;margin:1rem 0}",
         ".col{flex:1;min-width:0}",
         "@media (max-width:700px){.cols{display:block}.col+.col{margin-top:1rem}}",
+        "table{border-collapse:collapse;margin:1rem 0;width:100%;font-size:0.92em}",
+        "table th,table td{border:1px solid #ddd;padding:0.4em 0.7em;text-align:left;vertical-align:top}",
+        "table th{background:#f5f5f5}",
+        "pre{background:#282c34;color:#e6e6e6;padding:1em;border-radius:6px;overflow-x:auto;"
+        "font-size:0.88em;line-height:1.5}",
+        "pre code{font-family:Consolas,'Courier New',monospace}",
+        "ul,ol{margin:0.8rem 0;padding-left:1.6rem}",
+        "li{margin:0.25rem 0}",
         "</style>",
         "</head>",
         "<body>",
@@ -1125,6 +1440,31 @@ MARKDOWN_INLINE_ESCAPE_RE = re.compile(r"([\\`*_\[\]<>&])")
 MARKDOWN_LEADING_DIGIT_RE = re.compile(r"^(\d+)\.(\s|$)")
 
 
+def escape_markdown_inline(text):
+    """Escape only the inline syntax characters (emphasis, links, code
+    spans, raw HTML/entities) - deliberately WITHOUT the leading-character
+    guard escape_markdown() adds, since this is meant to be safe to call
+    on a run/fragment that isn't necessarily at the start of a line (see
+    render_runs_markdown) - a mid-sentence run that happens to start with
+    "-" (e.g. the second half of a bold/plain split on "test-driven")
+    must not be treated as if it opened a new line."""
+    return MARKDOWN_INLINE_ESCAPE_RE.sub(r"\\\1", text)
+
+
+def escape_markdown_leading_guard(text):
+    """Prefix a backslash if text's own first character would otherwise
+    be parsed as block-level Markdown syntax (heading/list marker/ordered-
+    list start) when it's actually just the first character of extracted
+    prose."""
+    if text[:1] in "#-+":
+        return "\\" + text
+    match = MARKDOWN_LEADING_DIGIT_RE.match(text)
+    if match:
+        digits = match.group(1)
+        return text[:len(digits)] + "\\." + text[len(digits) + 1:]
+    return text
+
+
 def escape_markdown(text):
     """Escape characters CommonMark/GFM treats as syntax (emphasis, links,
     code spans) or raw HTML/entities. Text pulled out of a document is not
@@ -1135,15 +1475,7 @@ def escape_markdown(text):
     element - for <noframes> specifically, browsers hide that content
     outright, so the rendered page silently ends right there.
     """
-    text = MARKDOWN_INLINE_ESCAPE_RE.sub(r"\\\1", text)
-    if text[:1] in "#-+":
-        text = "\\" + text
-    else:
-        match = MARKDOWN_LEADING_DIGIT_RE.match(text)
-        if match:
-            digits = match.group(1)
-            text = text[:len(digits)] + "\\." + text[len(digits) + 1:]
-    return text
+    return escape_markdown_leading_guard(escape_markdown_inline(text))
 
 
 def escape_markdown_image_alt(text):
@@ -1153,17 +1485,58 @@ def escape_markdown_image_alt(text):
     return re.sub(r"([\\`*_<>&])", r"\\\1", text)
 
 
+def render_runs_markdown(runs):
+    parts = []
+    for run in runs:
+        text = escape_markdown_inline(run["text"])
+        if run["bold"] and run["italic"]:
+            text = f"***{text}***"
+        elif run["bold"]:
+            text = f"**{text}**"
+        elif run["italic"]:
+            text = f"*{text}*"
+        href = run.get("href")
+        if href:
+            text = f"[{text}]({href})"
+        parts.append(text)
+    return escape_markdown_leading_guard("".join(parts))
+
+
 def render_block_markdown(block):
     block_type = block["type"]
     if block_type in ("p", "p_numeric"):
-        return escape_markdown(block["text"])
+        return render_runs_markdown(block["runs"]) if block.get("runs") else linkify_markdown(block["text"])
     if block_type == "h":
         return ("#" * block["level"]) + " " + escape_markdown(block["text"])
+    if block_type == "li":
+        # "1." for every ordered item is valid CommonMark - renderers
+        # number from the first item's value and increment themselves.
+        marker = "1." if block.get("ordered") else "-"
+        return f"{marker} {linkify_markdown(block['text'])}"
     if block_type == "img":
         return f'![{escape_markdown_image_alt(block["alt"])}]({block["src"]})'
     if block_type == "img_placeholder":
         caption = escape_markdown(block["caption"]) if block["caption"] else None
         return f'*[Изображение: {caption}]*' if caption else "*[Изображение]*"
+    if block_type == "table":
+        def cell(text):
+            # A literal "|" would otherwise be read as a new column
+            # boundary by any Markdown table renderer - on top of the
+            # usual inline escaping, it needs its own explicit escape.
+            return escape_markdown(text).replace("|", "\\|") or " "
+        header, *body = block["rows"]
+        lines = ["| " + " | ".join(cell(c) for c in header) + " |"]
+        lines.append("|" + "|".join(" --- " for _ in header) + "|")
+        for row in body:
+            lines.append("| " + " | ".join(cell(c) for c in row) + " |")
+        return "\n".join(lines)
+    if block_type == "code":
+        text = block["text"]
+        # Content inside a fenced code block is taken literally by
+        # CommonMark - no inline escaping needed, and this is what avoids
+        # the raw-HTML-tag risk escape_markdown() exists for elsewhere.
+        fence = "~~~" if "```" in text else "```"
+        return f"{fence}\n{text}\n{fence}"
     raise ValueError(f"unknown block type: {block_type}")
 
 
@@ -1187,10 +1560,20 @@ def render_block_txt(block):
     block_type = block["type"]
     if block_type in ("p", "p_numeric", "h"):
         return block["text"]
+    if block_type == "li":
+        return f"  - {block['text']}"
     if block_type == "img":
         return f'[Изображение: {block["alt"]}]' if block["alt"] else "[Изображение]"
     if block_type == "img_placeholder":
         return f'[Изображение: {block["caption"]}]' if block["caption"] else "[Изображение]"
+    if block_type == "table":
+        rows = block["rows"]
+        widths = [max(len(row[c]) for row in rows) for c in range(len(rows[0]))]
+        lines = ["  ".join(cell.ljust(w) for cell, w in zip(row, widths)) for row in rows]
+        lines.insert(1, "  ".join("-" * w for w in widths))
+        return "\n".join(lines)
+    if block_type == "code":
+        return block["text"]
     raise ValueError(f"unknown block type: {block_type}")
 
 
@@ -1246,6 +1629,206 @@ def _with_layout_fields(block, para):
     return block
 
 
+def clean_table_rows(raw_rows):
+    """page.find_tables()'s raw extract() is noisy in two specific ways
+    that would otherwise corrupt a table's meaning if rendered as-is:
+
+    1. It routinely over-segments columns - a genuine 4-column table often
+       comes back as 9-12 columns, most of them empty/None in every row
+       (whitespace inside a cell misread as a column boundary). Columns
+       that are empty in every row carry no information and are dropped.
+    2. A wrapped multi-line cell (the source table's row text spans two
+       printed lines) comes back as an extra row of its own, with only
+       that one column populated and every other cell empty/None. Such a
+       lone-value row is folded back into the same column of the
+       preceding row instead of appearing as a spurious near-empty row.
+
+    Returns a list of rows (list of str, already through clean_text()),
+    or [] if nothing meaningful survives.
+    """
+    if not raw_rows:
+        return []
+
+    def is_empty(value):
+        return value is None or not str(value).strip()
+
+    width = max(len(row) for row in raw_rows)
+    padded = [list(row) + [None] * (width - len(row)) for row in raw_rows]
+    kept_columns = [c for c in range(width) if any(not is_empty(row[c]) for row in padded)]
+    if not kept_columns:
+        return []
+
+    rows = [
+        [
+            "" if is_empty(row[c]) else clean_text(str(row[c])).replace("\n", " ").strip()
+            for c in kept_columns
+        ]
+        for row in padded
+    ]
+
+    merged = []
+    for row in rows:
+        non_empty = [i for i, value in enumerate(row) if value]
+        if merged and len(non_empty) == 1 and merged[-1][non_empty[0]]:
+            i = non_empty[0]
+            merged[-1][i] = merged[-1][i] + " " + row[i]
+            continue
+        if non_empty:
+            merged.append(row)
+    return _merge_split_columns(merged)
+
+
+def _merge_split_columns(rows):
+    """A third find_tables() quirk clean_table_rows's caller hasn't
+    addressed yet: a single logical column sometimes still comes back as
+    two ADJACENT surviving columns, because the detector misjudged where
+    one cell's text ends and the next begins - e.g. a "sbyte" row's type
+    name lands in column 0 while a "byte" row's lands in column 1 of the
+    very same logical "type name" column (mutually exclusive per row), or
+    a wide cell's text is duplicated verbatim into both of two adjacent
+    columns. Two adjacent columns are safely the same logical column if,
+    in every row, their values never conflict - either at most one of them
+    is non-empty, or both are non-empty and identical.
+    """
+    if not rows or not rows[0]:
+        return rows
+    ncols = len(rows[0])
+    groups = [[0]]
+    for c in range(1, ncols):
+        candidate = groups[-1] + [c]
+        conflict = any(
+            len({row[i] for i in candidate if row[i]}) > 1
+            for row in rows
+        )
+        if conflict:
+            groups.append([c])
+        else:
+            groups[-1] = candidate
+
+    def resolve(row, group):
+        for i in group:
+            if row[i]:
+                return row[i]
+        return ""
+
+    return [[resolve(row, group) for group in groups] for row in rows]
+
+
+def _table_region_is_actually_code(table_rect, page_dict):
+    """find_tables() mistakes a code listing's own layout for a table
+    surprisingly easily: a line-number gutter reads as one column and the
+    wall of code as another. If a "Лістинг/Листинг N.N" caption or a
+    monospace-font block sits mostly inside the candidate table's own
+    bbox, that candidate isn't a real table - it's a listing, and belongs
+    to the code-detection path (see extract_page_blocks) instead."""
+    for block in page_dict["blocks"]:
+        if block["type"] != 0:
+            continue
+        block_rect = pymupdf.Rect(block["bbox"])
+        block_area = block_rect.width * block_rect.height
+        if block_area <= 0:
+            continue
+        overlap = block_rect & table_rect
+        if overlap.is_empty or (overlap.width * overlap.height) / block_area <= 0.5:
+            continue
+        if is_monospace_font_name(dominant_font_name(block)):
+            return True
+        if LISTING_CAPTION_RE.match(extract_block_text(block)):
+            return True
+    return False
+
+
+def find_page_links(page):
+    """External URI and internal cross-page links as (pymupdf.Rect, href)
+    pairs. An internal GOTO link resolves to this tool's own "#page-N"
+    section anchor (render_page_html already emits id="page-N" for every
+    page), so a working table-of-contents/index entry survives the
+    conversion instead of just leaving the link's own destination
+    unreadable. Other link kinds (launch actions, named destinations) are
+    rare and skipped rather than guessed at."""
+    try:
+        links = page.get_links()
+    except Exception:
+        return []
+    results = []
+    for link in links:
+        rect = link.get("from")
+        if rect is None:
+            continue
+        kind = link.get("kind")
+        if kind == pymupdf.LINK_URI:
+            uri = link.get("uri")
+            if uri:
+                results.append((pymupdf.Rect(rect), uri))
+        elif kind == pymupdf.LINK_GOTO:
+            target_page = link.get("page")
+            if isinstance(target_page, int) and target_page >= 0:
+                results.append((pymupdf.Rect(rect), f"#page-{target_page + 1}"))
+    return results
+
+
+def find_page_tables(page, page_dict):
+    """Detect real data tables via PyMuPDF's own page.find_tables() - only
+    meaningful on a page whose text layer is intact (on an OCR-fallback
+    page it tends to mistake a screenshot or a callout box for a table,
+    since it works off the same broken text/positions everything else
+    struggles with there). Returns a list of (pymupdf.Rect, rows) for
+    tables that survive clean_table_rows() with enough real structure to
+    be worth rendering as a table at all, excluding candidates that are
+    actually a code listing in disguise (see _table_region_is_actually_code).
+    """
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return []
+    results = []
+    for table in finder.tables:
+        rect = pymupdf.Rect(table.bbox)
+        if _table_region_is_actually_code(rect, page_dict):
+            continue
+        rows = clean_table_rows(table.extract())
+        if len(rows) >= TABLE_MIN_ROWS and len(rows[0]) >= TABLE_MIN_COLUMNS:
+            results.append((rect, rows))
+    return results
+
+
+def split_block_into_list_items(block):
+    """A PDF block sometimes bundles several list items into one block,
+    because ordinary paragraph line-spacing sits between them and
+    PyMuPDF's own block segmentation has no reason to split there (e.g. a
+    numbered quiz-answer list where each answer is only one line) - joining
+    every line in the block with a single space, as a normal paragraph
+    does, would silently erase the item boundaries instead of just missing
+    <li> markup. If at least two of the block's own lines open with a list
+    marker, split on those boundaries instead of extracting it as one
+    run-on paragraph.
+
+    Returns a list of (text, ordered_or_None) - ordered_or_None is None
+    for a leading chunk of text before the first marker (if any); returns
+    None (not a list) when fewer than two marker lines are found.
+    """
+    line_texts = [
+        clean_text("".join(span.get("text", "") for span in line.get("spans", [])))
+        for line in block.get("lines", [])
+    ]
+    marker_at = [i for i, t in enumerate(line_texts) if strip_list_marker(t.strip())]
+    if len(marker_at) < 2:
+        return None
+
+    chunks = []
+    if marker_at[0] > 0:
+        intro = " ".join(t for t in line_texts[:marker_at[0]] if t.strip())
+        if intro.strip():
+            chunks.append((intro, None))
+    for idx, start in enumerate(marker_at):
+        end = marker_at[idx + 1] if idx + 1 < len(marker_at) else len(line_texts)
+        item_text, ordered = strip_list_marker(line_texts[start].strip())
+        rest = " ".join(t for t in line_texts[start + 1:end] if t.strip())
+        full_text = f"{item_text} {rest}".strip() if rest else item_text
+        chunks.append((full_text, ordered))
+    return chunks
+
+
 def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, generate_alt,
                          caption_backend, use_gpu, lmstudio_url, lmstudio_model):
     """Extract one page's content into a format-independent structure: a
@@ -1283,25 +1866,94 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
             elif para.get("heading_level"):
                 blocks.append(_with_layout_fields({"type": "h", "level": para["heading_level"], "text": text}, para))
             else:
-                blocks.append(_with_layout_fields({"type": "p", "text": text}, para))
+                list_item = strip_list_marker(text)
+                if list_item:
+                    item_text, ordered = list_item
+                    blocks.append(_with_layout_fields({"type": "li", "text": item_text, "ordered": ordered}, para))
+                else:
+                    blocks.append(_with_layout_fields({"type": "p", "text": text}, para))
     else:
         page_height = page.rect.height
         body_size = compute_body_font_size(page_dict, page_height)
+        tables = find_page_tables(page, page_dict)
+        link_rects = find_page_links(page)
+        footnote_markers = collect_superscript_digit_markers(page_dict)
+        emitted_tables = set()
+        next_block_is_code = False
         for block in page_dict["blocks"]:
             if block["type"] != 0:
                 continue
+            block_rect = pymupdf.Rect(block["bbox"])
+            block_area = block_rect.width * block_rect.height
+            table_hit_rows = None
+            if block_area > 0:
+                for table_rect, table_rows in tables:
+                    overlap = block_rect & table_rect
+                    if overlap.is_empty:
+                        continue
+                    if (overlap.width * overlap.height) / block_area > TABLE_BLOCK_OVERLAP_MIN_RATIO:
+                        table_hit_rows = table_rows
+                        break
+            if table_hit_rows is not None:
+                next_block_is_code = False
+                if id(table_hit_rows) not in emitted_tables:
+                    emitted_tables.add(id(table_hit_rows))
+                    blocks.append({"type": "table", "rows": table_hit_rows})
+                continue
+
+            # A code listing's own font is usually monospace (Konovalenko);
+            # when it isn't (ci_sharp's subset fonts have no real name to
+            # go by), the block immediately following a "Лістинг/Листинг
+            # N.N" caption is trusted instead - see LISTING_CAPTION_RE
+            # below, which only matches a caption at the very START of a
+            # paragraph (never a mid-sentence mention like "см. листинг 3.2").
+            if is_monospace_font_name(dominant_font_name(block)) or next_block_is_code:
+                next_block_is_code = False
+                code_text = clean_code_text(extract_block_code_raw_text(block))
+                if code_text.strip():
+                    blocks.append({"type": "code", "text": code_text})
+                continue
+
+            list_items = split_block_into_list_items(block)
+            if list_items is not None:
+                next_block_is_code = False
+                for item_text, ordered in list_items:
+                    if not item_text.strip():
+                        continue
+                    if ordered is None:
+                        blocks.append({"type": "p", "text": item_text})
+                    else:
+                        blocks.append({"type": "li", "text": item_text, "ordered": ordered})
+                continue
+
             text = extract_block_text(block)
             if not text.strip():
                 continue
             if is_margin_text(block["bbox"][1], block["bbox"][3], page_height, text):
-                margin_items.extend(split_margin_number(text))
+                marker_match = FOOTNOTE_MARKER_RE.match(text)
+                is_footnote = bool(marker_match and marker_match.group(1) in footnote_markers)
+                if not is_footnote:
+                    margin_items.extend(split_margin_number(text))
+                    continue
+            if LISTING_CAPTION_RE.match(text):
+                next_block_is_code = True
+                blocks.append({"type": "p", "text": text})
                 continue
             block_size, bold_ratio = block_font_stats(block)
             level = classify_heading_level(text, block_size, bold_ratio, body_size)
             if level:
                 blocks.append({"type": "h", "level": level, "text": text})
             else:
-                blocks.append({"type": "p", "text": text})
+                list_item = strip_list_marker(text)
+                if list_item:
+                    item_text, ordered = list_item
+                    blocks.append({"type": "li", "text": item_text, "ordered": ordered})
+                else:
+                    p_block = {"type": "p", "text": text}
+                    runs = block_emphasis_runs(block, link_rects)
+                    if runs:
+                        p_block["runs"] = runs
+                    blocks.append(p_block)
 
     image_index = 0
     for block in page_dict["blocks"]:
