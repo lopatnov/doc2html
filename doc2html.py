@@ -143,6 +143,17 @@ HEADING_BODY_SIZE_MIN_CHARS = 200
 HEADING_OCR_HEIGHT_RATIO_H3 = 1.25
 HEADING_OCR_HEIGHT_RATIO_H2 = 1.5
 HEADING_OCR_MAX_CHARS = 80
+# A wrapped SECOND (or later) line of a multi-line heading often measures
+# shorter than HEADING_OCR_HEIGHT_RATIO_H3 even in the exact same display
+# font - a short line with few/no tall glyphs (e.g. "книге" finishing
+# "Путеводитель по этой книге") simply has a smaller OCR bounding box than
+# a full first line does. What actually distinguishes it from the next
+# ordinary paragraph's opening line is the gap above it: display headings
+# are set with tighter leading than the gap before body text resumes, so
+# only a row both reasonably tall AND unusually close to the row above it
+# gets accepted as a heading continuation - see _looks_like_heading_continuation.
+HEADING_OCR_CONTINUATION_HEIGHT_RATIO = 0.9
+HEADING_OCR_CONTINUATION_GAP_RATIO = 0.5
 
 # ocr_region_paragraphs(): converts a paragraph's pixel indent (relative to
 # its own column's leftmost row) into a CSS "em" unit, so a nested sub-item
@@ -563,35 +574,68 @@ def strip_list_marker(text):
     return None
 
 
-def _finalize_ocr_paragraph(current, text, row_count, median_height):
-    """A paragraph that never merged with a neighboring row (row_count == 1)
-    and is noticeably taller than the page's median row height is very
-    likely a heading, not a coincidentally short paragraph - font size
+def _looks_like_heading_row(height, text, median_height):
+    """A single row that's noticeably taller than the page's median row
+    height, short, and not obviously something else (a table-of-contents/
+    index entry, a numeric block) reads as a section title - font size
     metadata doesn't survive OCR, so height is the only proxy available.
-    Deliberately conservative (single row, short, no terminal punctuation):
-    missing a real heading is far less damaging than turning an ordinary
-    short paragraph into one.
-    """
-    para = {**current, "text": text}
-    height = current["y1"] - current["y0"]
+    This is the STRICT bar, required to START a heading run in
+    reflow_rows_into_paragraphs (see _looks_like_heading_continuation for
+    the relaxed bar used to keep extending one)."""
+    if median_height <= 0:
+        return False
     stripped = text.rstrip()
-    looks_like_heading = (
-        row_count == 1
-        and median_height > 0
-        and height >= median_height * HEADING_OCR_HEIGHT_RATIO_H3
+    return bool(
+        height >= median_height * HEADING_OCR_HEIGHT_RATIO_H3
         and len(text) <= HEADING_OCR_MAX_CHARS
         and stripped
         and stripped[-1] not in PARAGRAPH_TERMINATOR_CHARS
         and not is_numeric_heavy(text)
         # A leading or trailing page number means this is a table-of-
-        # contents/index entry (see reflow_rows_into_paragraphs), never a
-        # section title, even if it happens to sit taller than the page's
-        # median row (e.g. a bolded top-level entry in a nested TOC).
+        # contents/index entry, never a section title, even if it happens
+        # to sit taller than the page's median row (e.g. a bolded
+        # top-level entry in a nested TOC).
         and TRAILING_PAGE_NUMBER_RE.search(stripped) is None
         and LEADING_PAGE_NUMBER_RE.match(stripped) is None
     )
-    if looks_like_heading:
-        para["heading_level"] = 2 if height >= median_height * HEADING_OCR_HEIGHT_RATIO_H2 else 3
+
+
+def _looks_like_heading_continuation(height, text, gap, median_height):
+    """Relaxed version of _looks_like_heading_row() for a row that might be
+    the wrapped SECOND (or later) line of an already-started heading rather
+    than its opening line - a short continuation line (e.g. "книге"
+    finishing "Путеводитель по этой книге") often measures shorter than
+    the strict bar even in the exact same display font, simply for having
+    fewer/no tall glyphs. What actually marks it as a continuation is the
+    gap above it: display headings are set with tighter leading than the
+    gap before body text resumes, so the height bar is only relaxed when
+    the gap is unusually tight too - on its own, "row height near the
+    page median" is true of about half of all rows and would swallow
+    ordinary paragraphs into the heading."""
+    if median_height <= 0:
+        return False
+    stripped = text.rstrip()
+    return bool(
+        gap <= median_height * HEADING_OCR_CONTINUATION_GAP_RATIO
+        and height >= median_height * HEADING_OCR_CONTINUATION_HEIGHT_RATIO
+        and len(text) <= HEADING_OCR_MAX_CHARS
+        and stripped
+        and stripped[-1] not in PARAGRAPH_TERMINATOR_CHARS
+        and not is_numeric_heavy(text)
+        and TRAILING_PAGE_NUMBER_RE.search(stripped) is None
+        and LEADING_PAGE_NUMBER_RE.match(stripped) is None
+    )
+
+
+def _finalize_ocr_paragraph(current, text, is_heading_run, max_row_height, median_height):
+    """is_heading_run is True only when EVERY row merged into this
+    paragraph individually passed _looks_like_heading_row - see
+    reflow_rows_into_paragraphs. max_row_height (the tallest of those
+    rows, not the paragraph's total merged height, which grows with every
+    extra line) decides h2 vs h3."""
+    para = {**current, "text": text}
+    if is_heading_run:
+        para["heading_level"] = 2 if max_row_height >= median_height * HEADING_OCR_HEIGHT_RATIO_H2 else 3
     return para
 
 
@@ -613,34 +657,37 @@ def reflow_rows_into_paragraphs(rows):
     median_height = sorted(heights)[len(heights) // 2] or 10
     gap_threshold = median_height * PARAGRAPH_GAP_RATIO
 
+    def row_height(r):
+        return r["y1"] - r["y0"]
+
     paragraphs = []
     current_text = rows[0]["text"]
     current = dict(rows[0])
-    current_row_count = 1
+    current_is_heading_run = _looks_like_heading_row(row_height(rows[0]), rows[0]["text"], median_height)
+    current_max_row_height = row_height(rows[0])
+
     for row in rows[1:]:
         gap = row["y0"] - current["y1"]
         prev_text = current_text.rstrip()
-        prev_height = current["y1"] - current["y0"]
-        # A short, isolated, noticeably taller row (a section title's own
-        # font is bigger than body text) never continues into the next row
-        # even without terminal punctuation - unlike an ordinary paragraph
-        # opener, a title is never "unfinished". Without this, a heading
-        # sitting right above body text with normal paragraph spacing gets
-        # silently absorbed into that paragraph before heading detection
-        # (see _finalize_ocr_paragraph) ever runs on it.
-        prev_looks_like_heading = (
-            current_row_count == 1
-            and median_height > 0
-            and prev_height >= median_height * HEADING_OCR_HEIGHT_RATIO_H3
-            and len(prev_text) <= HEADING_OCR_MAX_CHARS
-            and not is_numeric_heavy(prev_text)
-            and TRAILING_PAGE_NUMBER_RE.search(prev_text) is None
+        this_row_height = row_height(row)
+        row_is_heading_shaped = _looks_like_heading_row(this_row_height, row["text"], median_height)
+        # A heading in progress (every row merged into it so far looked
+        # heading-shaped) keeps extending across a line wrap as long as the
+        # next row is ALSO heading-shaped, or - since a short second line
+        # like "книге" often falls short of the strict height bar on its
+        # own - looks like a tightly-spaced continuation of it (see
+        # _looks_like_heading_continuation). Either way, a heading must
+        # still never silently absorb the ordinary body paragraph sitting
+        # right below it.
+        row_continues_heading = current_is_heading_run and (
+            row_is_heading_shaped
+            or _looks_like_heading_continuation(this_row_height, row["text"], gap, median_height)
         )
         prev_finished = (
             not prev_text
             or prev_text[-1] in PARAGRAPH_TERMINATOR_CHARS
             or TRAILING_PAGE_NUMBER_RE.search(prev_text) is not None
-            or prev_looks_like_heading
+            or (current_is_heading_run and not row_continues_heading)
         )
         next_starts_new_entry = (
             bool(LEADING_PAGE_NUMBER_RE.match(row["text"]))
@@ -650,13 +697,19 @@ def reflow_rows_into_paragraphs(rows):
             current_text = prev_text + " " + row["text"]
             current["y1"] = row["y1"]
             current["x1"] = max(current["x1"], row["x1"])
-            current_row_count += 1
+            current_is_heading_run = current_is_heading_run and row_continues_heading
+            current_max_row_height = max(current_max_row_height, this_row_height)
         else:
-            paragraphs.append(_finalize_ocr_paragraph(current, current_text, current_row_count, median_height))
+            paragraphs.append(_finalize_ocr_paragraph(
+                current, current_text, current_is_heading_run, current_max_row_height, median_height,
+            ))
             current_text = row["text"]
             current = dict(row)
-            current_row_count = 1
-    paragraphs.append(_finalize_ocr_paragraph(current, current_text, current_row_count, median_height))
+            current_is_heading_run = row_is_heading_shaped
+            current_max_row_height = this_row_height
+    paragraphs.append(_finalize_ocr_paragraph(
+        current, current_text, current_is_heading_run, current_max_row_height, median_height,
+    ))
     return paragraphs
 
 
@@ -749,7 +802,7 @@ def ocr_page_regions(page, page_dict, use_gpu):
     reader = get_ocr_reader(use_gpu)
     scale = OCR_RENDER_DPI / 72.0
     callout_boxes = find_callout_boxes(page, page_dict)
-    boundary_pt = detect_column_boundary_x(page_dict, page.rect.height)
+    boundary_pt = detect_column_boundary_x(page_dict, page.rect.height, callout_boxes)
     gutter = (boundary_pt[0] * scale, boundary_pt[1] * scale) if boundary_pt is not None else None
 
     pixmap = page.get_pixmap(dpi=OCR_RENDER_DPI)
@@ -859,7 +912,7 @@ def _blocks_run_in_parallel(left, right):
     return (matches / len(smaller)) >= COLUMN_SIBLING_MATCH_MIN_RATIO
 
 
-def detect_column_boundary_x(page_dict, page_height):
+def detect_column_boundary_x(page_dict, page_height, callout_boxes=None):
     """Look at the page's own text-block bounding boxes for a genuine
     column boundary - independent of (and far more reliable than) the OCR
     text this function's caller is about to produce, because glyph
@@ -874,7 +927,14 @@ def detect_column_boundary_x(page_dict, page_height):
     clearly-separated x0 groups instead. Running headers/footers are
     excluded first since their bboxes are often oddly shaped (e.g. one
     wide block spanning both a page number and a chapter title) and would
-    just add noise.
+    just add noise - and so is any block sitting inside a detected
+    callout/sidebar box (see find_callout_boxes): a callout parked in the
+    page's side margin next to a single real column of body text has
+    exactly the same "one wide x0 gap" signature as genuine parallel
+    columns, and without this exclusion gets mistaken for one - which then
+    splits the real column's own rows at that fake gutter, tearing
+    sentences out of the middle of the main flow into a bogus "second
+    column" instead of just mis-labeling a sidebar.
 
     Returns a (left, right) PDF-point interval - the true empty gutter
     between the two columns' blocks, NOT their midpoint, since a block's
@@ -885,6 +945,20 @@ def detect_column_boundary_x(page_dict, page_height):
         b for b in page_dict["blocks"]
         if b["type"] == 0 and not is_in_margin_zone(b["bbox"][1], b["bbox"][3], page_height)
     ]
+    if callout_boxes:
+        def _in_callout(block):
+            block_rect = pymupdf.Rect(block["bbox"])
+            block_area = block_rect.width * block_rect.height
+            if block_area <= 0:
+                return False
+            for box in callout_boxes:
+                overlap = block_rect & box
+                if overlap.is_empty:
+                    continue
+                if (overlap.width * overlap.height) / block_area > CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
+                    return True
+            return False
+        text_blocks = [b for b in text_blocks if not _in_callout(b)]
     if len(text_blocks) < 4:
         return None
     ordered = sorted(text_blocks, key=lambda b: b["bbox"][0])
