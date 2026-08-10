@@ -10,6 +10,12 @@
         . .\activate.ps1
     Running it as ".\activate.ps1" (without the leading ". ") will not
     leave the environment active afterward.
+
+    Requires PowerShell to already be conda-initialized - if `conda
+    activate` fails with something like "CommandNotFoundError" or "run
+    'conda init' before 'conda activate'", run once (new PowerShell
+    session afterward):
+        conda init powershell
 #>
 
 Write-Host "Activating pdf2html environment..."

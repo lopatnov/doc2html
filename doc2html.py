@@ -104,6 +104,10 @@ CALLOUT_IMAGE_OVERLAP_MAX_RATIO = 0.5
 # area sits inside the table's bbox, so it's rendered once as part of the
 # table instead of also appearing as a separate, duplicated paragraph.
 TABLE_BLOCK_OVERLAP_MIN_RATIO = 0.5
+# extract_page_blocks() (non-OCR path): a text block counts as "inside" a
+# vector-graphics callout box (see find_callout_boxes) when this much of
+# its own area sits inside the box's bbox.
+CALLOUT_BLOCK_OVERLAP_MIN_RATIO = 0.5
 # page.find_tables() often over-segments into spurious all-empty columns
 # and turns a wrapped multi-line cell into an extra almost-empty row - a
 # detected table is only trusted once cleaned down to at least this many
@@ -1058,6 +1062,11 @@ def block_emphasis_runs(block, link_rects=None):
 
 
 LISTING_CAPTION_RE = re.compile(r"^(?:Лістинг|Листинг)\s+\d")
+# A callout/admonition box that isn't drawn with a vector-graphics border
+# at all (find_callout_boxes only catches the bordered kind) still often
+# opens with one of these labels - a text-level trigger is the only way
+# to recognize it in that case (see extract_page_blocks).
+NOTE_LABEL_RE = re.compile(r"^(?:ПРИМЕЧАНИЕ|ВНИМАНИЕ|СОВЕТ)\b")
 MONOSPACE_FONT_HINTS = ("courier", "consolas", "mono", "menlo", "cascadia", "roboto mono")
 
 
@@ -1456,7 +1465,7 @@ def escape_markdown_leading_guard(text):
     be parsed as block-level Markdown syntax (heading/list marker/ordered-
     list start) when it's actually just the first character of extracted
     prose."""
-    if text[:1] in "#-+":
+    if text and text[0] in "#-+":
         return "\\" + text
     match = MARKDOWN_LEADING_DIGIT_RE.match(text)
     if match:
@@ -1714,13 +1723,16 @@ def _merge_split_columns(rows):
     return [[resolve(row, group) for group in groups] for row in rows]
 
 
-def _table_region_is_actually_code(table_rect, page_dict):
-    """find_tables() mistakes a code listing's own layout for a table
-    surprisingly easily: a line-number gutter reads as one column and the
-    wall of code as another. If a "Лістинг/Листинг N.N" caption or a
-    monospace-font block sits mostly inside the candidate table's own
-    bbox, that candidate isn't a real table - it's a listing, and belongs
-    to the code-detection path (see extract_page_blocks) instead."""
+def _region_is_actually_code(region_rect, page_dict):
+    """Both find_tables() (a line-number gutter reads as one column, the
+    wall of code as another) and find_callout_boxes() (a listing's own
+    vector-graphics border is geometrically indistinguishable from a
+    genuine callout/tip box) mistake a bordered code listing's layout for
+    something else surprisingly easily. If a "Лістинг/Листинг N.N"
+    caption or a monospace-font block sits mostly inside the candidate
+    region's own bbox, that candidate isn't a real table/callout - it's a
+    listing, and belongs to the code-detection path (see
+    extract_page_blocks) instead."""
     for block in page_dict["blocks"]:
         if block["type"] != 0:
             continue
@@ -1728,7 +1740,7 @@ def _table_region_is_actually_code(table_rect, page_dict):
         block_area = block_rect.width * block_rect.height
         if block_area <= 0:
             continue
-        overlap = block_rect & table_rect
+        overlap = block_rect & region_rect
         if overlap.is_empty or (overlap.width * overlap.height) / block_area <= 0.5:
             continue
         if is_monospace_font_name(dominant_font_name(block)):
@@ -1775,7 +1787,7 @@ def find_page_tables(page, page_dict):
     struggles with there). Returns a list of (pymupdf.Rect, rows) for
     tables that survive clean_table_rows() with enough real structure to
     be worth rendering as a table at all, excluding candidates that are
-    actually a code listing in disguise (see _table_region_is_actually_code).
+    actually a code listing in disguise (see _region_is_actually_code).
     """
     try:
         finder = page.find_tables()
@@ -1784,7 +1796,7 @@ def find_page_tables(page, page_dict):
     results = []
     for table in finder.tables:
         rect = pymupdf.Rect(table.bbox)
-        if _table_region_is_actually_code(rect, page_dict):
+        if _region_is_actually_code(rect, page_dict):
             continue
         rows = clean_table_rows(table.extract())
         if len(rows) >= TABLE_MIN_ROWS and len(rows[0]) >= TABLE_MIN_COLUMNS:
@@ -1878,6 +1890,10 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
         tables = find_page_tables(page, page_dict)
         link_rects = find_page_links(page)
         footnote_markers = collect_superscript_digit_markers(page_dict)
+        callout_boxes = [
+            box for box in find_callout_boxes(page, page_dict)
+            if not _region_is_actually_code(box, page_dict)
+        ]
         emitted_tables = set()
         next_block_is_code = False
         for block in page_dict["blocks"]:
@@ -1914,6 +1930,22 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
                     blocks.append({"type": "code", "text": code_text})
                 continue
 
+            in_callout_box = False
+            if block_area > 0:
+                for box in callout_boxes:
+                    overlap = block_rect & box
+                    if overlap.is_empty:
+                        continue
+                    if (overlap.width * overlap.height) / block_area > CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
+                        in_callout_box = True
+                        break
+            if in_callout_box:
+                next_block_is_code = False
+                callout_text = extract_block_text(block)
+                if callout_text.strip():
+                    callout_items.append(callout_text)
+                continue
+
             list_items = split_block_into_list_items(block)
             if list_items is not None:
                 next_block_is_code = False
@@ -1935,6 +1967,9 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
                 if not is_footnote:
                     margin_items.extend(split_margin_number(text))
                     continue
+            if NOTE_LABEL_RE.match(text):
+                callout_items.append(text)
+                continue
             if LISTING_CAPTION_RE.match(text):
                 next_block_is_code = True
                 blocks.append({"type": "p", "text": text})

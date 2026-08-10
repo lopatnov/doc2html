@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Creates the "pdf2html" conda environment (name kept for backward
     compatibility with existing installs; runs doc2html.py) and installs

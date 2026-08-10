@@ -26,6 +26,7 @@ import doc2html
 INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
 NIELSEN = INPUT_DIR / "Веб-дизайн книга Якоба Нильсена.pdf"
 KONOVALENKO = INPUT_DIR / "Konovalenko I. .NET-C#.pdf"
+NON_DESIGNERS = INPUT_DIR / "Non-Designers-Design-Book.pdf"
 
 CHECKS = []
 
@@ -116,7 +117,7 @@ def _(page_data):
     assert superscript_runs, "ни один run не помечен superscript - проверь flags&1 в extract_block_runs"
 
 
-@check(INPUT_DIR / "Non-Designers-Design-Book.pdf", 4,
+@check(NON_DESIGNERS, 4,
        "реальные PDF-ссылки (внешний URL и mailto:) сохраняются, а не отбрасываются молча")
 def _(page_data):
     hrefs = [
@@ -141,7 +142,7 @@ def _(page_data):
     ), "курсивный run с 'налагоджувачем' не найден - проверь extract_block_runs"
 
 
-@check(INPUT_DIR / "Non-Designers-Design-Book.pdf", 284,
+@check(NON_DESIGNERS, 284,
        "нумерованный список, слипшийся в один PDF-блок, разбивается на отдельные li")
 def _(page_data):
     items = [b for b in page_data["blocks"] if b["type"] == "li"]
@@ -149,16 +150,25 @@ def _(page_data):
     assert all(b.get("ordered") for b in items), "все пункты должны быть нумерованными (ordered=True)"
 
 
-@check(KONOVALENKO, 90, "код в листинге распознаётся как блок кода с сохранением отступов, не как таблица")
+@check(KONOVALENKO, 90, "код в листинге распознаётся как блок кода с сохранением отступов, не как таблица/врезка")
 def _(page_data):
     code_blocks = [b for b in page_data["blocks"] if b["type"] == "code"]
     assert len(code_blocks) == 1, f"ожидал 1 блок кода на странице 90, нашёл {len(code_blocks)}"
     assert not any(b["type"] == "table" for b in page_data["blocks"]), \
-        "листинг с колонкой номеров строк не должен ошибочно распознаваться как таблица - проверь _table_region_is_actually_code"
+        "листинг с колонкой номеров строк не должен ошибочно распознаваться как таблица - проверь _region_is_actually_code"
+    assert not page_data.get("callout"), \
+        "рамка вокруг листинга не должна распознаваться как врезка - проверь _region_is_actually_code в фильтре callout_boxes"
     text = code_blocks[0]["text"]
     assert "    student.Name" in text, \
         "отступ перед 'student.Name' потерян - проверь extract_block_code_raw_text (не должен .strip() строки)"
     assert "\n" in text, "код должен сохранять переносы строк, а не склеиваться в одну строку"
+
+
+@check(INPUT_DIR / "ci_sharp.pdf", 73, "безрамочная врезка 'ПРИМЕЧАНИЕ' распознаётся по текстовой метке")
+def _(page_data):
+    assert page_data.get("callout"), "врезка ПРИМЕЧАНИЕ не найдена - проверь NOTE_LABEL_RE"
+    assert any("Рассмотренное приложение" in c for c in page_data["callout"]), \
+        "текст врезки не совпадает с ожидаемым"
 
 
 @check(KONOVALENKO, 44, "таблица типов C# распознаётся как настоящая таблица, а не россыпь абзацев")
@@ -214,6 +224,13 @@ def main():
                 print(f"OK      {label}")
             except AssertionError as exc:
                 print(f"ОШИБКА  {label}: {exc}")
+                failed += 1
+            except Exception as exc:
+                # A renamed/removed block key (KeyError etc.) after a schema
+                # change is exactly the kind of regression this script exists
+                # to catch - it must not silently abort the whole run and
+                # skip every check after it.
+                print(f"ОШИБКА  {label}: неожиданное исключение {type(exc).__name__}: {exc}")
                 failed += 1
 
         ran = len(CHECKS) - skipped
