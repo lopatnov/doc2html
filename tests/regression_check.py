@@ -150,6 +150,18 @@ def _(page_data):
     assert all(b.get("ordered") for b in items), "все пункты должны быть нумерованными (ordered=True)"
 
 
+@check(NON_DESIGNERS, 79, "картинки стоят на своей позиции в тексте, а не все скопом в конце страницы")
+def _(page_data):
+    types = [b["type"] for b in page_data["blocks"]]
+    # save_images=False in this test harness (see main()) - an image
+    # block comes back as "img_placeholder", not "img", but position in
+    # the block list is exactly what's under test either way.
+    img_indices = [i for i, t in enumerate(types) if t in ("img", "img_placeholder")]
+    assert len(img_indices) == 3, f"ожидал 3 картинки на странице 79, нашёл {len(img_indices)}"
+    assert any(t == "p" for t in types[:max(img_indices)]), \
+        "хотя бы один абзац должен идти ДО последней картинки - иначе картинки снова все в конце (см. merge в extract_page_blocks)"
+
+
 @check(KONOVALENKO, 90, "код в листинге распознаётся как блок кода с сохранением отступов, не как таблица/врезка")
 def _(page_data):
     code_blocks = [b for b in page_data["blocks"] if b["type"] == "code"]

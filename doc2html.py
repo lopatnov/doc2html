@@ -35,6 +35,15 @@ CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 OCR_LANGUAGES = ["ru", "en"]
 OCR_RENDER_DPI = 300
 IMAGE_RENDER_DPI = 200
+# convert_document(): re-rendering and rewriting the WHOLE output file after
+# every single page (for live progress - see module docstring) makes total
+# render work grow quadratically with page count. Throttling the in-loop
+# call to once every N pages keeps progress visible (plus one guaranteed
+# assemble right after the very first page of a run, so starting a big
+# conversion doesn't look stalled) while cutting that cost by ~N times; the
+# final assemble after the loop still guarantees a complete, up-to-date file
+# regardless of N.
+ASSEMBLE_EVERY_N_PAGES = 10
 # Share of control characters (below 0x20, excluding whitespace) in a page's
 # extracted text above which we treat its text layer as unusable.
 GARBLED_TEXT_THRESHOLD = 0.2
@@ -727,10 +736,13 @@ def ocr_page_regions(page, page_dict, use_gpu):
     that matters. Leaving either in the main pass would have OCR read
     on-screen UI chrome / a sidebar's unrelated text as if it were body text.
 
-    Returns (paragraphs, page_height_px) where each paragraph is
+    Returns (paragraphs, page_height_px, gutter) where each paragraph is
     {"text": str, "y0": float, "y1": float, "region": int} in the same pixel
     space as page_height_px (for header/footer position classification).
-    region 0 is the main flow; region >= 1 is a callout box.
+    region 0 is the main flow; region >= 1 is a callout box. gutter (also
+    in this pixel space, or None) is returned so the caller can place
+    embedded images - masked out here and extracted separately - into the
+    correct column instead of only ever appending them after the text.
     """
     from PIL import Image, ImageDraw
 
@@ -762,7 +774,7 @@ def ocr_page_regions(page, page_dict, use_gpu):
             para["region"] = 1
             paragraphs.append(para)
 
-    return paragraphs, main_image.height
+    return paragraphs, main_image.height, gutter
 
 
 def is_text_garbled(raw_text_blocks):
@@ -1841,6 +1853,35 @@ def split_block_into_list_items(block):
     return chunks
 
 
+def _merge_flow_entries(flow_entries, extra_entries):
+    """Merge extra (y0, column, block) entries - e.g. images pulled from a
+    separate extraction pass - into an already column-grouped, y0-ordered
+    list of (y0, column, block) entries, preserving each column's own
+    internal y0 order (and the column-then-column grouping the multi-
+    column HTML layout depends on) instead of a flat global sort by y0,
+    which would interleave two columns' content by height."""
+    column_order = []
+    groups = {}
+    for y0, column, block in flow_entries:
+        if column not in groups:
+            groups[column] = []
+            column_order.append(column)
+        groups[column].append((y0, block))
+
+    for y0, column, block in extra_entries:
+        group = groups.setdefault(column, [])
+        if column not in column_order:
+            column_order.append(column)
+        insert_at = len(group)
+        for i, (existing_y0, _existing_block) in enumerate(group):
+            if existing_y0 > y0:
+                insert_at = i
+                break
+        group.insert(insert_at, (y0, block))
+
+    return [block for column in column_order for _, block in groups[column]]
+
+
 def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, generate_alt,
                          caption_backend, use_gpu, lmstudio_url, lmstudio_model):
     """Extract one page's content into a format-independent structure: a
@@ -1854,6 +1895,7 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
     blocks = []
     margin_items = []
     callout_items = []
+    image_index = 0
 
     if use_ocr:
         print(
@@ -1861,29 +1903,62 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
             "распознаю текст через OCR...",
             file=sys.stderr,
         )
-        paragraphs, page_height_px = ocr_page_regions(page, page_dict, use_gpu)
+        paragraphs, page_height_px, gutter = ocr_page_regions(page, page_dict, use_gpu)
+
+        # Collected as (y0, column, block) instead of appended straight to
+        # `blocks` - embedded images are masked out of the OCR pass and
+        # extracted separately below, and need their own reading-order
+        # position among these paragraphs (see _merge_flow_entries)
+        # instead of always trailing at the very end of the page.
+        flow_entries = []
         for para in paragraphs:
             text = para["text"]
             if not text.strip():
                 continue
             if is_margin_text(para["y0"], para["y1"], page_height_px, text):
                 margin_items.extend(split_margin_number(text))
-            elif para["region"] > 0:
+                continue
+            if para["region"] > 0:
                 # A separate column (e.g. a margin callout box) running
                 # alongside the main flow - kept intact as its own block
                 # instead of interleaved line-by-line into the main text.
                 callout_items.append(text)
-            elif is_numeric_heavy(text):
-                blocks.append(_with_layout_fields({"type": "p_numeric", "text": text}, para))
+                continue
+            if is_numeric_heavy(text):
+                block = {"type": "p_numeric", "text": text}
             elif para.get("heading_level"):
-                blocks.append(_with_layout_fields({"type": "h", "level": para["heading_level"], "text": text}, para))
+                block = {"type": "h", "level": para["heading_level"], "text": text}
             else:
                 list_item = strip_list_marker(text)
                 if list_item:
                     item_text, ordered = list_item
-                    blocks.append(_with_layout_fields({"type": "li", "text": item_text, "ordered": ordered}, para))
+                    block = {"type": "li", "text": item_text, "ordered": ordered}
                 else:
-                    blocks.append(_with_layout_fields({"type": "p", "text": text}, para))
+                    block = {"type": "p", "text": text}
+            block = _with_layout_fields(block, para)
+            flow_entries.append((para["y0"], para.get("column"), block))
+
+        scale = OCR_RENDER_DPI / 72.0
+        image_entries = []
+        for block in page_dict["blocks"]:
+            if block["type"] != 1:
+                continue
+            image_index += 1
+            image_block = extract_image_block(
+                page, block, page_number, image_index, images_dir, save_images,
+                generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
+            )
+            if image_block is None:
+                continue
+            y0_px = block["bbox"][1] * scale
+            column = None
+            if gutter is not None:
+                x0_px = block["bbox"][0] * scale
+                column = 1 if x0_px >= gutter[1] else 0
+                image_block["column"] = column
+            image_entries.append((y0_px, column, image_block))
+
+        blocks.extend(_merge_flow_entries(flow_entries, image_entries))
     else:
         page_height = page.rect.height
         body_size = compute_body_font_size(page_dict, page_height)
@@ -1897,6 +1972,22 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
         emitted_tables = set()
         next_block_is_code = False
         for block in page_dict["blocks"]:
+            if block["type"] == 1:
+                # page_dict["blocks"] is produced with sort=True, so
+                # handling an image right here (instead of in a separate
+                # trailing pass) keeps it at its real reading-order
+                # position among the surrounding text - not always
+                # shoved to the bottom of the page, which would break
+                # the association between a figure and its caption.
+                next_block_is_code = False
+                image_index += 1
+                image_block = extract_image_block(
+                    page, block, page_number, image_index, images_dir, save_images,
+                    generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
+                )
+                if image_block is not None:
+                    blocks.append(image_block)
+                continue
             if block["type"] != 0:
                 continue
             block_rect = pymupdf.Rect(block["bbox"])
@@ -1989,17 +2080,6 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
                     if runs:
                         p_block["runs"] = runs
                     blocks.append(p_block)
-
-    image_index = 0
-    for block in page_dict["blocks"]:
-        if block["type"] == 1:
-            image_index += 1
-            image_block = extract_image_block(
-                page, block, page_number, image_index, images_dir, save_images,
-                generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
-            )
-            if image_block is not None:
-                blocks.append(image_block)
 
     return {
         "page_number": page_number,
@@ -2150,6 +2230,8 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
 
     out_file = output_dir / f"{input_path.stem}.{out_format}"
 
+    pages_since_assemble = 0
+    assembled_once = False
     for page_number in range(start_page, end_page + 1):
         if page_number in fragments:
             continue
@@ -2164,7 +2246,11 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
 
         fragments[page_number] = page_data
         write_fragment(pages_dir, page_number, page_data)
-        assemble_output(out_file, title, fragments, out_format)
+        pages_since_assemble += 1
+        if not assembled_once or pages_since_assemble >= ASSEMBLE_EVERY_N_PAGES:
+            assemble_output(out_file, title, fragments, out_format)
+            pages_since_assemble = 0
+            assembled_once = True
 
         print(f"Обработана страница {page_number}/{page_count}", file=sys.stderr)
 
