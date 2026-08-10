@@ -95,17 +95,20 @@ running scripts is disabled"), один раз разрешите их для с
 Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 ```
 
-Создаст conda-окружение **`pdf2html`** (имя окружения оставлено как
-есть для обратной совместимости с уже установленным — переименование
-означало бы переустановку тяжёлых пакетов типа torch/easyocr на
-несколько ГБ; если хотите переименовать и его, самый дешёвый способ —
-`conda create -n doc2html --clone pdf2html`, затем
-`conda env remove -n pdf2html`, это копирует уже скачанные пакеты, а
-не качает их заново) и поставит базовые зависимости из
-`requirements.txt` (PyMuPDF, Pillow, torch, easyocr) — их достаточно
+Создаст conda-окружение **`doc2html`** и поставит базовые зависимости
+из `requirements.txt` (PyMuPDF, Pillow, torch, easyocr) — их достаточно
 для конвертации без подписей (по умолчанию) или с
 `--generate-alt lmstudio`. Модель EasyOCR (ru+en, ~100 МБ) скачается
 один раз при первом обращении.
+
+Если у вас уже стоит старое окружение `pdf2html` (проект раньше
+назывался иначе), клонировать его быстрее, чем ставить заново —
+торч/easyocr не перекачиваются:
+
+```powershell
+conda create -n doc2html --clone pdf2html
+conda env remove -n pdf2html
+```
 
 Офлайн-бэкенд подписей `--generate-alt blip` требует пакет
 `transformers` — он **не ставится по умолчанию** (это отдельная
@@ -117,7 +120,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 .\install.ps1 -WithBlip
 
 # Или потом, в уже созданное окружение
-conda run -n pdf2html python -m pip install -r requirements-blip.txt
+conda run -n doc2html python -m pip install -r requirements-blip.txt
 ```
 
 Сами веса модели BLIP (~1 ГБ) скачаются один раз при первом реальном

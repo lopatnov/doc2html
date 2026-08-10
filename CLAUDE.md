@@ -7,14 +7,14 @@ PyMuPDF) в HTML/Markdown/txt с сохранением картинок. Под
 ## Тестирование при разработке
 
 - Реальные книги лежат в `input/` (не коммитятся, см. `.gitignore`).
-- `conda run -n pdf2html python ...` иногда падает на Windows с
+- `conda run -n doc2html python ...` иногда падает на Windows с
   `UnicodeEncodeError`/`CONDA_NO_PLUGINS` при выводе кириллицы — надёжнее
   звать интерпретатор окружения напрямую:
-  `C:\Users\Lopat\miniconda3\envs\pdf2html\python.exe doc2html.py ...`
+  `C:\Users\Lopat\miniconda3\envs\doc2html\python.exe doc2html.py ...`
   (и `export PYTHONIOENCODING=utf-8` в Bash-сессии).
 - **После любой правки формата/схемы блоков — гонять
   `tests/regression_check.py`** тем же интерпретатором окружения, что и
-  выше (`C:\Users\Lopat\miniconda3\envs\pdf2html\python.exe
+  выше (`C:\Users\Lopat\miniconda3\envs\doc2html\python.exe
   tests\regression_check.py`, не голый `python` — иначе можно случайно
   попасть на системный интерпретатор без нужных пакетов). Запускает
   реальную конвертацию (с

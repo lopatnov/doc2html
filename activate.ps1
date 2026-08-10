@@ -1,8 +1,6 @@
 <#
 .SYNOPSIS
-    Activates the "pdf2html" conda environment (used by doc2html.py; name
-    kept for backward compatibility with existing installs) in the current
-    shell.
+    Activates the "doc2html" conda environment in the current shell.
 .DESCRIPTION
     Must be dot-sourced so the environment activation (PATH, prompt, etc.)
     persists in your interactive session rather than only inside this
@@ -18,5 +16,5 @@
         conda init powershell
 #>
 
-Write-Host "Activating pdf2html environment..."
-conda activate pdf2html
+Write-Host "Activating doc2html environment..."
+conda activate doc2html

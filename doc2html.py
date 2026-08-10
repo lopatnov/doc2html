@@ -183,7 +183,7 @@ def get_captioner(use_gpu):
         except ImportError:
             raise SystemExit(
                 "Пакет transformers не установлен (нужен для --generate-alt blip). "
-                "Поставьте: conda run -n pdf2html python -m pip install -r requirements-blip.txt "
+                "Поставьте: conda run -n doc2html python -m pip install -r requirements-blip.txt "
                 "- либо используйте --generate-alt lmstudio или --generate-alt off."
             )
 
@@ -2288,7 +2288,7 @@ def main(argv=None):
     if generate_alt and caption_backend == "blip" and not check_blip_available():
         print(
             "Ошибка: пакет transformers не установлен (нужен для --generate-alt blip). "
-            "Поставьте: conda run -n pdf2html python -m pip install -r requirements-blip.txt "
+            "Поставьте: conda run -n doc2html python -m pip install -r requirements-blip.txt "
             "- либо используйте --generate-alt lmstudio.",
             file=sys.stderr,
         )
