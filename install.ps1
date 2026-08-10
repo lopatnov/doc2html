@@ -1,6 +1,8 @@
 <#
 .SYNOPSIS
-    Creates the pdf2html conda environment and installs dependencies.
+    Creates the "pdf2html" conda environment (name kept for backward
+    compatibility with existing installs; runs doc2html.py) and installs
+    dependencies.
 .PARAMETER WithBlip
     Also install the optional offline BLIP captioning backend
     (requirements-blip.txt). Not needed for --generate-alt lmstudio or

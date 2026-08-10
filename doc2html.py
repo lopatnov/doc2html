@@ -1,12 +1,19 @@
 #!/usr/bin/env python
-"""Convert a PDF document into a readable UTF-8 HTML document.
+"""Convert a document (PDF, EPUB, XPS, MOBI, FB2, CBZ, images, ... -
+anything PyMuPDF can open) into readable UTF-8 HTML, Markdown, or plain
+text, extracting embedded images along the way.
 
-Handles the mixed/broken text encodings common in PDFs (custom font
-subsets, private-use-area glyph codes, ligatures) and extracts embedded
-images into a sibling ``images`` folder, optionally captioning them for
-the ``alt`` attribute. Supports converting a page range, streams the
-HTML output to disk page by page, and automatically resumes an
-interrupted run.
+Handles the mixed/broken text encodings common in scanned/converted PDFs
+(custom font subsets, private-use-area glyph codes, ligatures), falling
+back to OCR (with its own layout reconstruction - see cluster_rows/
+find_callout_boxes) when a page's text layer turns out to be unusable.
+Supports converting a page range, streams output to disk page by page, and
+automatically resumes an interrupted run.
+
+Each page is extracted ONCE into a format-independent structure (see
+extract_page_blocks) and cached to disk as JSON; HTML/Markdown/txt
+rendering happens from that structure, so switching --out-format on a
+later run never requires redoing OCR.
 """
 
 import argparse
@@ -22,14 +29,14 @@ import urllib.request
 from html import escape
 from pathlib import Path
 
-import fitz  # PyMuPDF
+import pymupdf
 
 CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
 OCR_LANGUAGES = ["ru", "en"]
 OCR_RENDER_DPI = 300
 IMAGE_RENDER_DPI = 200
 # Share of control characters (below 0x20, excluding whitespace) in a page's
-# extracted text above which we treat the PDF's text layer as unusable.
+# extracted text above which we treat its text layer as unusable.
 GARBLED_TEXT_THRESHOLD = 0.2
 GARBLED_TEXT_MIN_LENGTH = 20
 # Text confined to the top/bottom N% of a page and short enough is treated as
@@ -66,7 +73,10 @@ ROW_MIN_Y_OVERLAP_RATIO = 0.5
 PARAGRAPH_GAP_RATIO = 1.3
 # A trailing "<space><1-4 digits>" is treated as a page-number reference that
 # closes out a table-of-contents/index entry, so the next row always starts a
-# new paragraph instead of running on into it.
+# new paragraph instead of running on into it. Also used to tell a page
+# number apart from a running head in the page margin (see
+# dedup_running_heads): only the latter is suppressed on repeat pages.
+PAGE_NUMBER_TOKEN_RE = re.compile(r"^\d{1,4}[.,]?$")
 TRAILING_PAGE_NUMBER_RE = re.compile(r"\s\d{1,4}[.,]?$")
 PARAGRAPH_TERMINATOR_CHARS = ".!?:;»)”"
 # A vector-graphics region (see find_callout_boxes) spanning most of the
@@ -305,23 +315,23 @@ def find_callout_boxes(page, page_dict):
     """Detect rectangular decorative regions (e.g. a margin callout/tip box)
     from the page's own vector graphics (border lines/fills) - independent
     of the (possibly broken) text layer, and far more reliable than trying
-    to infer columns from OCR text geometry: this book's callout boxes turn
-    out to share the SAME baseline grid as the main column, so a box's side
-    text can align almost exactly with a main-column line at the same
-    height, which defeats any purely position-based text heuristic.
+    to infer columns from OCR text geometry: some books' callout boxes share
+    the SAME baseline grid as the main column, so a box's side text can
+    align almost exactly with a main-column line at the same height, which
+    defeats any purely position-based text heuristic.
 
     A box's border is typically drawn as several separate thin line/fill
     segments; segments that touch or nearly touch are merged into one
-    region. Returns a list of fitz.Rect, filtered to plausible partial-width
-    boxes - a full-width rect (e.g. a header underline) or a tiny stray mark
-    isn't a callout box - and with anything that's mostly a frame drawn
-    around an embedded image (e.g. a screenshot border) excluded, since
-    OCR'ing that region would just read the picture's own on-screen text as
-    if it were callout prose.
+    region. Returns a list of pymupdf.Rect, filtered to plausible partial-
+    width boxes - a full-width rect (e.g. a header underline) or a tiny
+    stray mark isn't a callout box - and with anything that's mostly a
+    frame drawn around an embedded image (e.g. a screenshot border)
+    excluded, since OCR'ing that region would just read the picture's own
+    on-screen text as if it were callout prose.
     """
     drawings = page.get_drawings()
     page_width = page.rect.width
-    rects = [fitz.Rect(d["rect"]) for d in drawings if d.get("rect") is not None]
+    rects = [pymupdf.Rect(d["rect"]) for d in drawings if d.get("rect") is not None]
     rects = [r for r in rects if r.width >= 0.5 or r.height >= 0.5]
     if not rects:
         return []
@@ -343,7 +353,7 @@ def find_callout_boxes(page, page_dict):
 
     for i in range(n):
         a = rects[i]
-        expanded = fitz.Rect(a.x0 - tolerance, a.y0 - tolerance, a.x1 + tolerance, a.y1 + tolerance)
+        expanded = pymupdf.Rect(a.x0 - tolerance, a.y0 - tolerance, a.x1 + tolerance, a.y1 + tolerance)
         for j in range(i + 1, n):
             if expanded.intersects(rects[j]):
                 union(i, j)
@@ -354,9 +364,9 @@ def find_callout_boxes(page, page_dict):
         if root in groups:
             groups[root] |= rects[i]
         else:
-            groups[root] = fitz.Rect(rects[i])
+            groups[root] = pymupdf.Rect(rects[i])
 
-    image_rects = [fitz.Rect(b["bbox"]) for b in page_dict["blocks"] if b["type"] == 1]
+    image_rects = [pymupdf.Rect(b["bbox"]) for b in page_dict["blocks"] if b["type"] == 1]
 
     boxes = []
     for rect in groups.values():
@@ -451,18 +461,17 @@ def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0):
 
 
 def ocr_page_regions(page, page_dict, use_gpu):
-    """Render a page to an image and OCR it, for PDFs whose text layer is
-    broken, reconstructing rows/paragraphs from the raw detections (see
+    """Render a page to an image and OCR it, for documents whose text layer
+    is broken, reconstructing rows/paragraphs from the raw detections (see
     cluster_rows/reflow_rows_into_paragraphs).
 
     Embedded raster images AND any detected callout boxes (find_callout_
     boxes) are blanked out of the MAIN pass and OCR'd separately instead:
-    images are already extracted/captioned by render_image_block(), and a
+    images are already extracted/captioned by extract_image_block(), and a
     callout box's text needs its own isolated OCR pass rather than being
     read together with the main column - see find_callout_boxes() for why
-    that matters on this book's layout. Leaving either in the main pass
-    would have OCR read on-screen UI chrome / a sidebar's unrelated text as
-    if it were body text.
+    that matters. Leaving either in the main pass would have OCR read
+    on-screen UI chrome / a sidebar's unrelated text as if it were body text.
 
     Returns (paragraphs, page_height_px) where each paragraph is
     {"text": str, "y0": float, "y1": float, "region": int} in the same pixel
@@ -501,10 +510,11 @@ def ocr_page_regions(page, page_dict, use_gpu):
 
 
 def is_text_garbled(raw_text_blocks):
-    """Detect a broken font/ToUnicode mapping: PyMuPDF still emits *a* character
-    per glyph, but with no real CMap those characters are meaningless control
-    codes rather than actual letters - the classic symptom of the "wrong
-    encoding" problem this script exists to work around.
+    """Detect a broken font/ToUnicode mapping: the text layer still yields
+    *a* character per glyph, but with no real CMap those characters are
+    meaningless control codes rather than actual letters - the classic
+    symptom of the "wrong encoding" problem this script exists to work
+    around.
 
     Must run on RAW (pre-clean_text) extracted text: clean_text() strips
     exactly these control characters, so checking after cleaning would
@@ -527,6 +537,35 @@ def is_margin_text(y0, y1, page_height, text):
     return y1 <= top_limit or y0 >= bottom_limit
 
 
+def is_page_number_like(text):
+    """A margin item that's purely a page number - unlike a running head
+    (chapter/section title), it legitimately changes on every page, so
+    dedup_running_heads() never suppresses it."""
+    return bool(PAGE_NUMBER_TOKEN_RE.match(text.strip()))
+
+
+LEADING_MARGIN_NUMBER_RE = re.compile(r"^(\d{1,4})\s+(\S.*)$")
+TRAILING_MARGIN_NUMBER_RE = re.compile(r"^(.*\S)\s+(\d{1,4})$")
+
+
+def split_margin_number(text):
+    """A margin OCR paragraph sometimes glues a running head and its page
+    number into one string ("8 Содержание" / "Содержание 9") since both are
+    short and land close together - reflow_rows_into_paragraphs() has no
+    reason to keep them apart. Split them back into separate margin items
+    so dedup_running_heads() can recognize a repeated head regardless of
+    which page number happens to be attached to it that page.
+    """
+    text = text.strip()
+    match = LEADING_MARGIN_NUMBER_RE.match(text)
+    if match:
+        return [match.group(1), match.group(2)]
+    match = TRAILING_MARGIN_NUMBER_RE.match(text)
+    if match:
+        return [match.group(1), match.group(2)]
+    return [text]
+
+
 def is_numeric_heavy(text):
     """Flags OCR paragraphs that are mostly digits - typically a table-of-
     contents page-number column that got separated from its titles (see
@@ -539,14 +578,14 @@ def is_numeric_heavy(text):
 
 
 def clean_text(text):
-    """Normalize PDF/OCR-extracted text so it is well-formed, readable UTF-8.
+    """Normalize extracted text so it is well-formed, readable UTF-8.
 
-    PDFs frequently reference fonts with broken or missing ToUnicode CMaps.
-    PyMuPDF still maps such glyphs to *something*, but that something is
-    often a Private-Use-Area codepoint with no real meaning (renders as
-    tofu boxes) - those are stripped. Ligatures and other compatibility
-    characters are folded to their plain equivalents via NFKC. Hyphenated
-    line-wraps ("бо- лее") are rejoined into whole words.
+    Documents frequently reference fonts with broken or missing ToUnicode
+    CMaps. The text layer still maps such glyphs to *something*, but that
+    something is often a Private-Use-Area codepoint with no real meaning
+    (renders as tofu boxes) - those are stripped. Ligatures and other
+    compatibility characters are folded to their plain equivalents via
+    NFKC. Hyphenated line-wraps ("бо- лее") are rejoined into whole words.
     """
     if not text:
         return ""
@@ -571,6 +610,60 @@ def extract_block_raw_text(block):
 
 def extract_block_text(block):
     return clean_text(extract_block_raw_text(block))
+
+
+def dedup_running_heads(ordered_pages):
+    """Suppress a running head (a non-page-number margin item, e.g. a
+    chapter/section title) that's identical to the one on the immediately
+    preceding page - repeating it on every single page is just noise once
+    it's already been shown. A page number is never suppressed since it
+    genuinely changes each page.
+
+    Runs at RENDER time over the full in-order page sequence (not at
+    extraction time), so it gives the same result whether all pages were
+    produced in one run or resumed piecemeal across several, and works
+    identically for every --out-format since it only touches the shared
+    "margin_display" field each renderer reads. Mutates each page dict in
+    place; the original "margin" is left untouched for future re-renders.
+    """
+    previous_heads = set()
+    for page_data in ordered_pages:
+        margin = page_data.get("margin", [])
+        heads = [m for m in margin if not is_page_number_like(m)]
+        page_data["margin_display"] = [
+            m for m in margin if is_page_number_like(m) or m not in previous_heads
+        ]
+        previous_heads = set(heads)
+    return ordered_pages
+
+
+def render_block_html(block):
+    block_type = block["type"]
+    if block_type == "p":
+        return f"<p>{escape(block['text'])}</p>"
+    if block_type == "p_numeric":
+        return f'<p class="ocr-numbers">{escape(block["text"])}</p>'
+    if block_type == "img":
+        return f'<img src="{block["src"]}" alt="{escape(block["alt"])}" loading="lazy">'
+    if block_type == "img_placeholder":
+        if block["caption"]:
+            return f'<p class="image-placeholder">[Изображение: {escape(block["caption"])}]</p>'
+        return '<p class="image-placeholder">[Изображение]</p>'
+    raise ValueError(f"unknown block type: {block_type}")
+
+
+def render_page_html(page_data):
+    parts = [f'<section class="page" id="page-{page_data["page_number"]}">']
+    margin = page_data.get("margin_display", page_data["margin"])
+    if margin:
+        parts.append(f'<p class="page-meta">{escape(" · ".join(margin))}</p>')
+    parts.extend(render_block_html(b) for b in page_data["blocks"])
+    if page_data["callout"]:
+        parts.append('<aside class="callout">')
+        parts.extend(f"<p>{escape(t)}</p>" for t in page_data["callout"])
+        parts.append("</aside>")
+    parts.append("</section>")
+    return "\n".join(parts)
 
 
 def build_html_document(title, body_html):
@@ -603,16 +696,72 @@ def build_html_document(title, body_html):
     return "\n".join(parts)
 
 
-def render_image_block(page, block, page_number, image_index, images_dir, save_images,
-                        generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model):
+def render_block_markdown(block):
+    block_type = block["type"]
+    if block_type in ("p", "p_numeric"):
+        return block["text"]
+    if block_type == "img":
+        alt = block["alt"].replace("[", "(").replace("]", ")")
+        return f'![{alt}]({block["src"]})'
+    if block_type == "img_placeholder":
+        return f'*[Изображение: {block["caption"]}]*' if block["caption"] else "*[Изображение]*"
+    raise ValueError(f"unknown block type: {block_type}")
+
+
+def render_page_markdown(page_data):
+    parts = []
+    margin = page_data.get("margin_display", page_data["margin"])
+    if margin:
+        parts.append(f'*{" · ".join(margin)}*')
+    parts.extend(render_block_markdown(b) for b in page_data["blocks"])
+    if page_data["callout"]:
+        parts.append("\n".join(f"> {t}" for t in page_data["callout"]))
+    return "\n\n".join(p for p in parts if p and p.strip())
+
+
+def build_markdown_document(title, page_mds):
+    body = "\n\n---\n\n".join(page_mds)
+    return f"# {title}\n\n{body}\n"
+
+
+def render_block_txt(block):
+    block_type = block["type"]
+    if block_type in ("p", "p_numeric"):
+        return block["text"]
+    if block_type == "img":
+        return f'[Изображение: {block["alt"]}]' if block["alt"] else "[Изображение]"
+    if block_type == "img_placeholder":
+        return f'[Изображение: {block["caption"]}]' if block["caption"] else "[Изображение]"
+    raise ValueError(f"unknown block type: {block_type}")
+
+
+def render_page_txt(page_data):
+    parts = []
+    margin = page_data.get("margin_display", page_data["margin"])
+    if margin:
+        parts.append(f'[{" · ".join(margin)}]')
+    parts.extend(render_block_txt(b) for b in page_data["blocks"])
+    if page_data["callout"]:
+        parts.append("\n".join(f"    {t}" for t in page_data["callout"]))
+    return "\n\n".join(p for p in parts if p and p.strip())
+
+
+def build_txt_document(title, page_txts):
+    underline = "=" * len(title)
+    body = "\n\n----------\n\n".join(page_txts)
+    return f"{title}\n{underline}\n\n{body}\n"
+
+
+def extract_image_block(page, block, page_number, image_index, images_dir, save_images,
+                         generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model):
     # The raw bytes in block["image"] are the image XObject as stored in the
-    # PDF, BEFORE the placement matrix the page applies to it - for images
-    # under a flip/rotate/mirror transform those raw bytes come out upside
-    # down or mirrored. Rendering the page's own bbox instead reproduces
-    # exactly what a reader sees, transform included.
-    bbox = fitz.Rect(block["bbox"])
+    # document, BEFORE the placement matrix the page applies to it - for
+    # images under a flip/rotate/mirror transform those raw bytes come out
+    # upside down or mirrored. Rendering the page's own bbox instead
+    # reproduces exactly what a reader sees, transform included.
+    bbox = pymupdf.Rect(block["bbox"])
     if bbox.is_empty or bbox.width < 1 or bbox.height < 1:
-        return []
+        return None
     pixmap = page.get_pixmap(clip=bbox, dpi=IMAGE_RENDER_DPI)
     image_bytes = pixmap.tobytes("png")
 
@@ -623,29 +772,27 @@ def render_image_block(page, block, page_number, image_index, images_dir, save_i
     if save_images:
         filename = f"image_{page_number:04d}_{image_index:04d}.png"
         (images_dir / filename).write_bytes(image_bytes)
-        alt_text = escape(caption) if caption else ""
-        return [f'<img src="images/{filename}" alt="{alt_text}" loading="lazy">']
-    if caption:
-        return [f'<p class="image-placeholder">[Изображение: {escape(caption)}]</p>']
-    return ['<p class="image-placeholder">[Изображение]</p>']
+        return {"type": "img", "src": f"images/{filename}", "alt": caption or ""}
+    return {"type": "img_placeholder", "caption": caption}
 
 
-def render_page(page, page_dict, page_number, images_dir, save_images, generate_alt,
-                 caption_backend, use_gpu, lmstudio_url, lmstudio_model):
-    """Build one page's <section> fragment. Returns the fragment HTML string."""
+def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, generate_alt,
+                         caption_backend, use_gpu, lmstudio_url, lmstudio_model):
+    """Extract one page's content into a format-independent structure: a
+    list of typed blocks plus margin/callout text (see module docstring for
+    why rendering is kept separate from this)."""
     raw_text_blocks = [
         extract_block_raw_text(block) for block in page_dict["blocks"] if block["type"] == 0
     ]
     use_ocr = is_text_garbled(raw_text_blocks)
 
-    body_items = []
+    blocks = []
     margin_items = []
     callout_items = []
-    image_index = 0
 
     if use_ocr:
         print(
-            f"Страница {page_number}: сломанная кодировка шрифта в PDF, "
+            f"Страница {page_number}: сломанная кодировка текстового слоя, "
             "распознаю текст через OCR...",
             file=sys.stderr,
         )
@@ -655,16 +802,16 @@ def render_page(page, page_dict, page_number, images_dir, save_images, generate_
             if not text.strip():
                 continue
             if is_margin_text(para["y0"], para["y1"], page_height_px, text):
-                margin_items.append(text)
+                margin_items.extend(split_margin_number(text))
             elif para["region"] > 0:
                 # A separate column (e.g. a margin callout box) running
                 # alongside the main flow - kept intact as its own block
                 # instead of interleaved line-by-line into the main text.
                 callout_items.append(text)
             elif is_numeric_heavy(text):
-                body_items.append(f'<p class="ocr-numbers">{escape(text)}</p>')
+                blocks.append({"type": "p_numeric", "text": text})
             else:
-                body_items.append(f"<p>{escape(text)}</p>")
+                blocks.append({"type": "p", "text": text})
     else:
         page_height = page.rect.height
         for block in page_dict["blocks"]:
@@ -674,45 +821,43 @@ def render_page(page, page_dict, page_number, images_dir, save_images, generate_
             if not text.strip():
                 continue
             if is_margin_text(block["bbox"][1], block["bbox"][3], page_height, text):
-                margin_items.append(text)
+                margin_items.extend(split_margin_number(text))
             else:
-                body_items.append(f"<p>{escape(text)}</p>")
+                blocks.append({"type": "p", "text": text})
 
+    image_index = 0
     for block in page_dict["blocks"]:
         if block["type"] == 1:
             image_index += 1
-            body_items.extend(render_image_block(
+            image_block = extract_image_block(
                 page, block, page_number, image_index, images_dir, save_images,
                 generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
-            ))
+            )
+            if image_block is not None:
+                blocks.append(image_block)
 
-    if callout_items:
-        body_items.append('<aside class="callout">')
-        body_items.extend(f"<p>{escape(text)}</p>" for text in callout_items)
-        body_items.append("</aside>")
-
-    parts = [f'<section class="page" id="page-{page_number}">']
-    if margin_items:
-        parts.append(f'<p class="page-meta">{escape(" · ".join(margin_items))}</p>')
-    parts.extend(body_items)
-    parts.append("</section>")
-    return "\n".join(parts)
+    return {
+        "page_number": page_number,
+        "margin": margin_items,
+        "blocks": blocks,
+        "callout": callout_items,
+    }
 
 
-def state_dir_for(output_dir, pdf_path):
-    return output_dir / f".{pdf_path.stem}.pdf2html-state"
+def state_dir_for(output_dir, input_path):
+    return output_dir / f".{input_path.stem}.doc2html-state"
 
 
-def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start_page, end_page):
+def load_or_init_state(state_dir, doc_identity, current_settings, restart, start_page, end_page):
     """Set up (or validate/resume) the per-page checkpoint directory.
 
-    Only the source PDF's *identity* (path/size/mtime) is a hard gate - mixing
-    fragments from two different documents would be silent data corruption.
-    --save-images/--generate-alt are allowed to change between invocations
-    (that's how you convert a book in chunks with different settings per
-    chunk, or add captions to a later range); a mismatch there just prints an
-    informational note, since already-written fragments simply keep whatever
-    format they were made with.
+    Only the source document's *identity* (path/size/mtime) is a hard gate -
+    mixing fragments from two different documents would be silent data
+    corruption. --save-images/--generate-alt are allowed to change between
+    invocations (that's how you convert a document in chunks with different
+    settings per chunk, or add captions to a later range); a mismatch there
+    just prints an informational note, since already-written fragments
+    simply keep whatever content they were extracted with.
     """
     meta_path = state_dir / "meta.json"
     pages_dir = state_dir / "pages"
@@ -723,9 +868,9 @@ def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             meta = None
-        if not meta or meta.get("identity") != pdf_identity:
+        if not meta or meta.get("identity") != doc_identity:
             raise SystemExit(
-                f"Папка состояния {state_dir.name} относится к другому PDF-файлу "
+                f"Папка состояния {state_dir.name} относится к другому файлу "
                 "(другой путь, размер или дата изменения). Укажите другую папку "
                 "-o для этого документа."
             )
@@ -734,8 +879,8 @@ def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start
             print(
                 "Обратите внимание: --save-images/--generate-alt отличаются от "
                 f"предыдущего запуска (было: {previous_settings}, сейчас: "
-                f"{current_settings}). Уже готовые страницы сохранят прежний "
-                "формат - новыми настройками будут обработаны только страницы, "
+                f"{current_settings}). Уже готовые страницы сохранят прежнее "
+                "содержимое - новыми настройками будут обработаны только страницы, "
                 "которых ещё нет в кеше. Чтобы пересчитать уже готовые страницы "
                 "текущего диапазона новыми настройками, используйте --restart.",
                 file=sys.stderr,
@@ -743,12 +888,12 @@ def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start
 
     if restart:
         for page_number in range(start_page, end_page + 1):
-            fragment_path = pages_dir / f"{page_number:04d}.html"
+            fragment_path = pages_dir / f"{page_number:04d}.json"
             if fragment_path.exists():
                 fragment_path.unlink()
 
     meta_path.write_text(
-        json.dumps({"identity": pdf_identity, "last_settings": current_settings},
+        json.dumps({"identity": doc_identity, "last_settings": current_settings},
                    ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
@@ -758,32 +903,45 @@ def load_or_init_state(state_dir, pdf_identity, current_settings, restart, start
 def read_existing_fragments(pages_dir, page_count):
     fragments = {}
     for page_number in range(1, page_count + 1):
-        fragment_path = pages_dir / f"{page_number:04d}.html"
+        fragment_path = pages_dir / f"{page_number:04d}.json"
         if fragment_path.exists():
-            content = fragment_path.read_text(encoding="utf-8")
-            if content.strip():
-                fragments[page_number] = content
+            try:
+                data = json.loads(fragment_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            fragments[page_number] = data
     return fragments
 
 
-def write_fragment(pages_dir, page_number, html_str):
-    (pages_dir / f"{page_number:04d}.html").write_text(html_str, encoding="utf-8")
+def write_fragment(pages_dir, page_number, page_data):
+    (pages_dir / f"{page_number:04d}.json").write_text(
+        json.dumps(page_data, ensure_ascii=False), encoding="utf-8",
+    )
 
 
-def assemble_output(out_file, title, fragments):
-    """Atomically (re)write the single assembled HTML file from whatever page
-    fragments exist so far, so it can be opened mid-run to see progress."""
-    ordered = [fragments[n] for n in sorted(fragments)]
-    html = build_html_document(title, "\n".join(ordered))
+def assemble_output(out_file, title, fragments, out_format):
+    """Atomically (re)write the single assembled output file, in whichever
+    format was requested, from whatever page fragments exist so far - so it
+    can be opened mid-run to see progress."""
+    ordered_pages = [fragments[n] for n in sorted(fragments)]
+    dedup_running_heads(ordered_pages)
+
+    if out_format == "md":
+        content = build_markdown_document(title, [render_page_markdown(p) for p in ordered_pages])
+    elif out_format == "txt":
+        content = build_txt_document(title, [render_page_txt(p) for p in ordered_pages])
+    else:
+        content = build_html_document(title, "\n".join(render_page_html(p) for p in ordered_pages))
+
     tmp_path = out_file.with_name(out_file.name + ".tmp")
-    tmp_path.write_text(html, encoding="utf-8")
+    tmp_path.write_text(content, encoding="utf-8")
     tmp_path.replace(out_file)
 
 
-def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
-                 start_page=1, end_page=None, restart=False, clean_state=False,
-                 caption_backend="blip", use_gpu=None,
-                 lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
+def convert_document(input_path, output_dir, save_images=True, generate_alt=True,
+                      start_page=1, end_page=None, restart=False, clean_state=True,
+                      caption_backend="blip", use_gpu=None, out_format="html",
+                      lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
     output_dir = Path(output_dir)
     images_dir = output_dir / "images"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -792,7 +950,7 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
 
     resolved_gpu = resolve_use_gpu(use_gpu)
 
-    doc = fitz.open(str(pdf_path))
+    doc = pymupdf.open(str(input_path))
     page_count = len(doc)
     if end_page is None:
         end_page = page_count
@@ -803,17 +961,17 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
         doc.close()
         raise SystemExit(f"--end-page {end_page} вне диапазона (в документе {page_count} стр.)")
 
-    title = clean_text(doc.metadata.get("title") or "") or pdf_path.stem
+    title = clean_text(doc.metadata.get("title") or "") or input_path.stem
 
-    stat = pdf_path.stat()
-    pdf_identity = {
-        "pdf_path": str(pdf_path.resolve()),
-        "pdf_size": stat.st_size,
-        "pdf_mtime": stat.st_mtime,
+    stat = input_path.stat()
+    doc_identity = {
+        "input_path": str(input_path.resolve()),
+        "input_size": stat.st_size,
+        "input_mtime": stat.st_mtime,
     }
     current_settings = {"save_images": save_images, "generate_alt": generate_alt}
-    state_dir = state_dir_for(output_dir, pdf_path)
-    pages_dir = load_or_init_state(state_dir, pdf_identity, current_settings, restart, start_page, end_page)
+    state_dir = state_dir_for(output_dir, input_path)
+    pages_dir = load_or_init_state(state_dir, doc_identity, current_settings, restart, start_page, end_page)
     fragments = read_existing_fragments(pages_dir, page_count)
 
     already_done = sum(1 for n in range(start_page, end_page + 1) if n in fragments)
@@ -825,7 +983,7 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
             file=sys.stderr,
         )
 
-    out_file = output_dir / (pdf_path.stem + ".html")
+    out_file = output_dir / f"{input_path.stem}.{out_format}"
 
     for page_number in range(start_page, end_page + 1):
         if page_number in fragments:
@@ -834,18 +992,24 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
         page = doc[page_number - 1]
         page_dict = page.get_text("dict", sort=True)
 
-        fragment_html = render_page(
+        page_data = extract_page_blocks(
             page, page_dict, page_number, images_dir, save_images, generate_alt,
             caption_backend, resolved_gpu, lmstudio_url, lmstudio_model,
         )
 
-        fragments[page_number] = fragment_html
-        write_fragment(pages_dir, page_number, fragment_html)
-        assemble_output(out_file, title, fragments)
+        fragments[page_number] = page_data
+        write_fragment(pages_dir, page_number, page_data)
+        assemble_output(out_file, title, fragments, out_format)
 
         print(f"Обработана страница {page_number}/{page_count}", file=sys.stderr)
 
     doc.close()
+
+    # Always (re)assemble at least once, even if every requested page was
+    # already cached and the loop above never touched assemble_output - e.g.
+    # re-running with a different --out-format against already-extracted
+    # pages must still produce that format's file.
+    assemble_output(out_file, title, fragments, out_format)
 
     if clean_state:
         done_count = sum(1 for n in range(1, page_count + 1) if n in fragments)
@@ -865,13 +1029,23 @@ def process_pdf(pdf_path, output_dir, save_images=True, generate_alt=True,
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Конвертация PDF в читаемый HTML (UTF-8) с сохранением картинок."
+        description=(
+            "Конвертация документа (PDF, EPUB, XPS, MOBI, FB2, CBZ и другие форматы, "
+            "которые открывает PyMuPDF) в читаемый HTML/Markdown/текст с сохранением картинок."
+        )
     )
-    parser.add_argument("input_pdf", help="Путь к исходному PDF-файлу")
+    parser.add_argument(
+        "input_file",
+        help="Путь к исходному файлу (PDF, EPUB, XPS, MOBI, FB2, CBZ, изображение и т.п.)",
+    )
     parser.add_argument(
         "-o", "--output-dir",
         default="output",
-        help="Папка для результата: HTML-файл и подпапка images (по умолчанию: %(default)s)",
+        help="Папка для результата: файл результата и подпапка images (по умолчанию: %(default)s)",
+    )
+    parser.add_argument(
+        "--out-format", choices=["html", "md", "txt"], default="html",
+        help="Формат результата: html (по умолчанию), md (Markdown) или txt (обычный текст)",
     )
     parser.add_argument(
         "--save-images", dest="save_images", action="store_true", default=True,
@@ -879,7 +1053,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--no-save-images", dest="save_images", action="store_false",
-        help="Не сохранять картинки - вместо <img> вставляется текстовое описание/заглушка",
+        help="Не сохранять картинки - вместо изображения вставляется текстовое описание/заглушка",
     )
     parser.add_argument(
         "--generate-alt", choices=["off", "blip", "lmstudio"], default="off",
@@ -903,12 +1077,16 @@ def parse_args(argv=None):
         help="Игнорировать состояние предыдущего прерванного запуска и начать заново",
     )
     parser.add_argument(
-        "--clean-state", action="store_true",
+        "--clean-state", dest="clean_state", action="store_true", default=True,
         help=(
             "Удалить служебную папку с промежуточными фрагментами страниц, когда "
             "весь документ (а не только запрошенный диапазон) окажется полностью "
-            "сконвертирован"
+            "сконвертирован (по умолчанию: включено)"
         ),
+    )
+    parser.add_argument(
+        "--no-clean-state", dest="clean_state", action="store_false",
+        help="Не удалять служебную папку состояния автоматически",
     )
     parser.add_argument(
         "--gpu", dest="use_gpu", action="store_true", default=None,
@@ -934,9 +1112,9 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
-    pdf_path = Path(args.input_pdf)
-    if not pdf_path.is_file():
-        print(f"Ошибка: файл не найден: {pdf_path}", file=sys.stderr)
+    input_path = Path(args.input_file)
+    if not input_path.is_file():
+        print(f"Ошибка: файл не найден: {input_path}", file=sys.stderr)
         return 1
 
     generate_alt = args.generate_alt != "off"
@@ -957,8 +1135,8 @@ def main(argv=None):
             print(f"Ошибка: {message}", file=sys.stderr)
             return 1
 
-    out_file = process_pdf(
-        pdf_path,
+    out_file = convert_document(
+        input_path,
         args.output_dir,
         save_images=args.save_images,
         generate_alt=generate_alt,
@@ -968,6 +1146,7 @@ def main(argv=None):
         clean_state=args.clean_state,
         caption_backend=caption_backend,
         use_gpu=args.use_gpu,
+        out_format=args.out_format,
         lmstudio_url=args.lmstudio_url,
         lmstudio_model=args.lmstudio_model,
     )
