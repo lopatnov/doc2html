@@ -79,12 +79,58 @@ PARAGRAPH_GAP_RATIO = 1.3
 PAGE_NUMBER_TOKEN_RE = re.compile(r"^\d{1,4}[.,]?$")
 TRAILING_PAGE_NUMBER_RE = re.compile(r"\s\d{1,4}[.,]?$")
 PARAGRAPH_TERMINATOR_CHARS = ".!?:;»)”"
+# split_merged_row(): the internal x-gap within a merged row must be at
+# least this many pixels (at OCR_RENDER_DPI) AND this many times the row's
+# other internal gaps before it's even considered a possible column split -
+# ordinary inter-word/inter-fragment gaps are far smaller than either.
+COLUMN_SPLIT_MIN_GAP = 100
+COLUMN_SPLIT_GAP_RATIO = 3.0
+# detect_column_boundary_x(): same idea as COLUMN_SPLIT_MIN_GAP/_GAP_RATIO
+# above, but applied to PDF text-BLOCK x0 positions in point space (not OCR
+# pixel space) - hence the separate, smaller absolute threshold.
+COLUMN_BOUNDARY_MIN_GAP_PT = 24
+# _blocks_run_in_parallel(): fraction of the smaller candidate column's
+# blocks that must have a same-height counterpart in the other candidate
+# column before the split is trusted as genuine side-by-side columns.
+COLUMN_SIBLING_MATCH_MIN_RATIO = 0.5
 # A vector-graphics region (see find_callout_boxes) spanning most of the
 # page width is a full-width rule (e.g. a header underline), not a margin
 # callout box; anything smaller than this is noise, not a real box.
 CALLOUT_MAX_WIDTH_RATIO = 0.85
 CALLOUT_MIN_SIZE_PT = 20
 CALLOUT_IMAGE_OVERLAP_MAX_RATIO = 0.5
+
+# --- Heading detection tuning ---
+# A text block/paragraph is promoted to a heading if its dominant font size
+# is at least this many times the page's own body-text size (see
+# compute_body_font_size) - or, on the OCR path where no font metadata
+# survives, if a single OCR row's height is at least this many times the
+# page's median row height (larger glyphs measure taller).
+HEADING_SIZE_RATIO_H3 = 1.15
+HEADING_SIZE_RATIO_H2 = 1.35
+HEADING_BOLD_RATIO_MIN = 0.8
+HEADING_BOLD_SIZE_TOLERANCE = 0.05
+HEADING_MAX_CHARS = 120
+# The page's body size is only trusted once measured across a reasonable
+# amount of running text - a title/colophon page has no real "body size" to
+# compare against, and guessing wrong there would misclassify everything on
+# the page instead of nothing.
+HEADING_BODY_SIZE_MIN_CHARS = 200
+HEADING_OCR_HEIGHT_RATIO_H3 = 1.25
+HEADING_OCR_HEIGHT_RATIO_H2 = 1.5
+HEADING_OCR_MAX_CHARS = 80
+
+# ocr_region_paragraphs(): converts a paragraph's pixel indent (relative to
+# its own column's leftmost row) into a CSS "em" unit, so a nested sub-item
+# under a column's own entries (e.g. bullets under a table-of-contents
+# title) keeps a visible indent in HTML even without real list markup. Only
+# ever computed for column-tagged paragraphs (a genuine PDF-geometry-
+# detected column) - an ordinary single-column paragraph's first line is
+# often indented by normal book typography, which would otherwise be
+# misread as a nested sub-item.
+OCR_INDENT_PX_PER_EM = OCR_RENDER_DPI / 72 * 11
+OCR_INDENT_MIN_EM = 0.3
+OCR_INDENT_MAX_EM = 4.0
 
 _caption_model = None
 _caption_processor = None
@@ -262,7 +308,71 @@ def vertical_overlap_ratio(a_y0, a_y1, b_y0, b_y1):
     return overlap / union if union > 0 else 0.0
 
 
-def cluster_rows(line_boxes):
+def split_merged_row(row, gutter=None):
+    """A row built by vertical-overlap merging can accidentally fuse two
+    DIFFERENT columns' entries that happen to share a baseline (e.g. a page
+    laid out in two text columns on a shared line grid) instead of
+    genuinely being one entry's title plus a far-off trailing page number
+    (e.g. a table-of-contents title separated from "27" by a sparse dot
+    leader). Both look identical as "one wide gap inside the row" - the
+    only reliable way to tell them apart is what's on the far side of that
+    gap: a bare page number is the normal single-column case and stays
+    merged; a whole second title means this was really two columns, so it
+    gets split off as its own row (recursively, in case a row fused three
+    or more columns).
+
+    gutter, if given, is a (left, right) pixel-space interval independently
+    derived from real PDF block geometry (see detect_column_boundary_x) -
+    when an internal gap in this row actually spans that interval, it is
+    trusted as the column split point regardless of its raw size, which is
+    what catches a genuine but narrow gutter (e.g. ~11pt in print, far
+    below COLUMN_SPLIT_MIN_GAP) that the size/ratio heuristic alone would
+    leave fused. Without a gutter (or when no gap spans it), the original
+    size/ratio heuristic is the only signal.
+    """
+    boxes = sorted(row["boxes"], key=lambda b: b["x0"])
+    if len(boxes) < 2:
+        return [row]
+
+    gaps = [boxes[i]["x0"] - boxes[i - 1]["x1"] for i in range(1, len(boxes))]
+
+    split_at = None
+    if gutter is not None:
+        gutter_left, gutter_right = gutter
+        for i, gap in enumerate(gaps):
+            if gap > 0 and boxes[i]["x1"] <= gutter_right and boxes[i + 1]["x0"] >= gutter_left:
+                split_at = i + 1
+                break
+
+    if split_at is None:
+        max_gap = max(gaps)
+        candidate = gaps.index(max_gap) + 1
+        if max_gap < COLUMN_SPLIT_MIN_GAP:
+            return [row]
+        other_gaps = gaps[:candidate - 1] + gaps[candidate:]
+        if other_gaps:
+            median_other = sorted(other_gaps)[len(other_gaps) // 2]
+            if median_other > 0 and max_gap < median_other * COLUMN_SPLIT_GAP_RATIO:
+                return [row]
+        split_at = candidate
+
+    right_boxes = boxes[split_at:]
+    if is_page_number_like(" ".join(b["text"] for b in right_boxes).strip()):
+        return [row]
+
+    left_boxes = boxes[:split_at]
+    left_row = {
+        "y0": min(b["y0"] for b in left_boxes), "y1": max(b["y1"] for b in left_boxes),
+        "boxes": left_boxes,
+    }
+    right_row = {
+        "y0": min(b["y0"] for b in right_boxes), "y1": max(b["y1"] for b in right_boxes),
+        "boxes": right_boxes,
+    }
+    return [left_row] + split_merged_row(right_row, gutter=gutter)
+
+
+def cluster_rows(line_boxes, gutter=None):
     """Merge raw OCR detections into visual rows by vertical (y-range)
     OVERLAP rather than center proximity or a fixed gap.
 
@@ -273,10 +383,18 @@ def cluster_rows(line_boxes):
     but still sit within the title's height), so they overlap heavily
     despite the huge horizontal gap. Two genuinely different lines at a
     similar height - including two columns running in parallel, e.g. a
-    margin callout beside the main text - normally overlap only a little,
-    since their baselines/font sizes rarely align that closely; a plain
-    center+tolerance test can't tell these two situations apart nearly as
-    reliably as overlap does.
+    two-column page on a shared line grid - can overlap just as heavily;
+    split_merged_row() below resolves that ambiguity afterward.
+
+    The y-overlap merge step itself deliberately does NOT take the column
+    gutter into account: a detector on justified text can emit one box per
+    WORD instead of per line (the stretched inter-word spacing looks like a
+    gap to it), and those words can individually land on either side of a
+    gutter computed from unrelated blocks even though they all belong to
+    the same, single-column printed line - filtering merges by gutter side
+    at this stage previously fragmented ordinary justified paragraphs into
+    a handful of disconnected words. gutter is only ever consulted
+    afterward, in split_merged_row(), once rows are already fully formed.
     """
     if not line_boxes:
         return []
@@ -294,8 +412,12 @@ def cluster_rows(line_boxes):
         if not merged:
             rows.append({"y0": box["y0"], "y1": box["y1"], "boxes": [box]})
 
-    result = []
+    split_rows = []
     for row in rows:
+        split_rows.extend(split_merged_row(row, gutter=gutter))
+
+    result = []
+    for row in split_rows:
         boxes = sorted(row["boxes"], key=lambda b: b["x0"])
         text = " ".join(b["text"] for b in boxes if b["text"].strip())
         if not text.strip():
@@ -390,13 +512,52 @@ def find_callout_boxes(page, page_dict):
     return boxes
 
 
+LEADING_PAGE_NUMBER_RE = re.compile(r"^\d{1,4}\s")
+
+
+def _finalize_ocr_paragraph(current, text, row_count, median_height):
+    """A paragraph that never merged with a neighboring row (row_count == 1)
+    and is noticeably taller than the page's median row height is very
+    likely a heading, not a coincidentally short paragraph - font size
+    metadata doesn't survive OCR, so height is the only proxy available.
+    Deliberately conservative (single row, short, no terminal punctuation):
+    missing a real heading is far less damaging than turning an ordinary
+    short paragraph into one.
+    """
+    para = {**current, "text": text}
+    height = current["y1"] - current["y0"]
+    stripped = text.rstrip()
+    looks_like_heading = (
+        row_count == 1
+        and median_height > 0
+        and height >= median_height * HEADING_OCR_HEIGHT_RATIO_H3
+        and len(text) <= HEADING_OCR_MAX_CHARS
+        and stripped
+        and stripped[-1] not in PARAGRAPH_TERMINATOR_CHARS
+        and not is_numeric_heavy(text)
+        # A leading or trailing page number means this is a table-of-
+        # contents/index entry (see reflow_rows_into_paragraphs), never a
+        # section title, even if it happens to sit taller than the page's
+        # median row (e.g. a bolded top-level entry in a nested TOC).
+        and TRAILING_PAGE_NUMBER_RE.search(stripped) is None
+        and LEADING_PAGE_NUMBER_RE.match(stripped) is None
+    )
+    if looks_like_heading:
+        para["heading_level"] = 2 if height >= median_height * HEADING_OCR_HEIGHT_RATIO_H2 else 3
+    return para
+
+
 def reflow_rows_into_paragraphs(rows):
     """Merge consecutive rows into paragraphs: close vertical spacing plus a
     row whose text doesn't already "look finished" (no terminal punctuation,
     no trailing page number) continues the paragraph; otherwise a new one
     starts. The trailing-page-number check is what keeps table-of-contents
     entries as separate one-line paragraphs instead of one giant run-on
-    block, even though they're single-spaced like a normal paragraph.
+    block, even though they're single-spaced like a normal paragraph - the
+    leading-page-number check does the same for a table laid out with the
+    number BEFORE the title ("28 Chapter Name") instead of after: a row
+    that opens with a page number is always a new entry, never a
+    continuation of the previous one.
     """
     if not rows:
         return []
@@ -407,32 +568,62 @@ def reflow_rows_into_paragraphs(rows):
     paragraphs = []
     current_text = rows[0]["text"]
     current = dict(rows[0])
+    current_row_count = 1
     for row in rows[1:]:
         gap = row["y0"] - current["y1"]
         prev_text = current_text.rstrip()
+        prev_height = current["y1"] - current["y0"]
+        # A short, isolated, noticeably taller row (a section title's own
+        # font is bigger than body text) never continues into the next row
+        # even without terminal punctuation - unlike an ordinary paragraph
+        # opener, a title is never "unfinished". Without this, a heading
+        # sitting right above body text with normal paragraph spacing gets
+        # silently absorbed into that paragraph before heading detection
+        # (see _finalize_ocr_paragraph) ever runs on it.
+        prev_looks_like_heading = (
+            current_row_count == 1
+            and median_height > 0
+            and prev_height >= median_height * HEADING_OCR_HEIGHT_RATIO_H3
+            and len(prev_text) <= HEADING_OCR_MAX_CHARS
+            and not is_numeric_heavy(prev_text)
+            and TRAILING_PAGE_NUMBER_RE.search(prev_text) is None
+        )
         prev_finished = (
             not prev_text
             or prev_text[-1] in PARAGRAPH_TERMINATOR_CHARS
             or TRAILING_PAGE_NUMBER_RE.search(prev_text) is not None
+            or prev_looks_like_heading
         )
-        if gap <= gap_threshold and not prev_finished:
+        next_starts_new_entry = bool(LEADING_PAGE_NUMBER_RE.match(row["text"]))
+        if gap <= gap_threshold and not prev_finished and not next_starts_new_entry:
             current_text = prev_text + " " + row["text"]
             current["y1"] = row["y1"]
             current["x1"] = max(current["x1"], row["x1"])
+            current_row_count += 1
         else:
-            paragraphs.append({**current, "text": current_text})
+            paragraphs.append(_finalize_ocr_paragraph(current, current_text, current_row_count, median_height))
             current_text = row["text"]
             current = dict(row)
-    paragraphs.append({**current, "text": current_text})
+            current_row_count = 1
+    paragraphs.append(_finalize_ocr_paragraph(current, current_text, current_row_count, median_height))
     return paragraphs
 
 
-def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0):
+def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0, gutter=None):
     """OCR an already-rendered (and already-masked, if relevant) region
     image and return reflowed paragraphs. offset_x/offset_y translate a
     cropped sub-image's local coordinates back into full-page pixel space,
     so a callout box's paragraphs are directly comparable (e.g. for
-    header/footer classification) to the main flow's.
+    header/footer classification) to the main flow's. gutter (already in
+    this same pixel space) is a genuine column gutter, if one was found for
+    the page - reading order needs the left column's rows fully
+    top-to-bottom before the right column's, not interleaved by height, or
+    reflow would stitch rows from different columns back together even
+    after cluster_rows kept them as separate rows. Column-tagged paragraphs
+    also carry a "column" index and, for rows indented past their column's
+    own leftmost row, an "indent_em" hint - both purely for HTML rendering
+    (see group_blocks_for_layout); md/txt ignore them since reading order
+    is already correct without them.
     """
     import numpy as np
 
@@ -450,13 +641,34 @@ def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0):
             "text": text,
         })
 
-    rows = cluster_rows(line_boxes)
+    rows = cluster_rows(line_boxes, gutter=gutter)
+
+    if gutter is None:
+        column_groups = [(None, rows)]
+    else:
+        gutter_left, gutter_right = gutter
+        left = sorted((r for r in rows if r["x0"] < gutter_right), key=lambda r: (r["y0"] + r["y1"]) / 2)
+        right = sorted((r for r in rows if r["x0"] >= gutter_right), key=lambda r: (r["y0"] + r["y1"]) / 2)
+        column_groups = [(idx, group) for idx, group in enumerate((left, right)) if group]
+
     paragraphs = []
-    for para in reflow_rows_into_paragraphs(rows):
-        text = clean_text(para["text"])
-        if not text.strip():
+    for col_index, group_rows in column_groups:
+        if not group_rows:
             continue
-        paragraphs.append({"text": text, "y0": para["y0"], "y1": para["y1"]})
+        group_min_x0 = min(r["x0"] for r in group_rows)
+        for para in reflow_rows_into_paragraphs(group_rows):
+            text = clean_text(para["text"])
+            if not text.strip():
+                continue
+            entry = {"text": text, "y0": para["y0"], "y1": para["y1"]}
+            if para.get("heading_level"):
+                entry["heading_level"] = para["heading_level"]
+            if col_index is not None:
+                entry["column"] = col_index
+                indent_em = round((para["x0"] - group_min_x0) / OCR_INDENT_PX_PER_EM, 1)
+                if OCR_INDENT_MIN_EM <= indent_em <= OCR_INDENT_MAX_EM:
+                    entry["indent_em"] = indent_em
+            paragraphs.append(entry)
     return paragraphs
 
 
@@ -483,6 +695,8 @@ def ocr_page_regions(page, page_dict, use_gpu):
     reader = get_ocr_reader(use_gpu)
     scale = OCR_RENDER_DPI / 72.0
     callout_boxes = find_callout_boxes(page, page_dict)
+    boundary_pt = detect_column_boundary_x(page_dict, page.rect.height)
+    gutter = (boundary_pt[0] * scale, boundary_pt[1] * scale) if boundary_pt is not None else None
 
     pixmap = page.get_pixmap(dpi=OCR_RENDER_DPI)
     main_image = Image.open(io.BytesIO(pixmap.tobytes("png"))).convert("RGB")
@@ -495,7 +709,7 @@ def ocr_page_regions(page, page_dict, use_gpu):
         draw.rectangle([box.x0 * scale, box.y0 * scale, box.x1 * scale, box.y1 * scale], fill="white")
 
     paragraphs = []
-    for para in ocr_region_paragraphs(reader, main_image):
+    for para in ocr_region_paragraphs(reader, main_image, gutter=gutter):
         para["region"] = 0
         paragraphs.append(para)
 
@@ -527,14 +741,99 @@ def is_text_garbled(raw_text_blocks):
     return (junk / len(combined)) > GARBLED_TEXT_THRESHOLD
 
 
+def is_in_margin_zone(y0, y1, page_height):
+    top_limit = page_height * MARGIN_ZONE_RATIO
+    bottom_limit = page_height * (1 - MARGIN_ZONE_RATIO)
+    return y1 <= top_limit or y0 >= bottom_limit
+
+
 def is_margin_text(y0, y1, page_height, text):
     """Short text confined to the page's top/bottom margin: a running header,
     chapter title, or lone page number rather than a body paragraph."""
     if not text or len(text) > MARGIN_TEXT_MAX_LEN:
         return False
-    top_limit = page_height * MARGIN_ZONE_RATIO
-    bottom_limit = page_height * (1 - MARGIN_ZONE_RATIO)
-    return y1 <= top_limit or y0 >= bottom_limit
+    return is_in_margin_zone(y0, y1, page_height)
+
+
+def _blocks_run_in_parallel(left, right):
+    """The real signature of two columns running side by side is that most
+    blocks on one side sit at the same height as SOME block on the other
+    side - not just that the two sides' overall y-ranges happen to
+    overlap. A title/colophon page with varied indentation (a centered
+    title block, then a wide byline, then a run of body blocks, then a
+    narrower imprint block near the bottom) can produce a big x0 gap and
+    an overlapping min/max y-range too, purely by coincidence, without any
+    of its blocks actually being side-by-side with another at the same
+    height - checking each block for a same-height counterpart catches
+    that difference.
+    """
+    smaller, larger = (left, right) if len(left) <= len(right) else (right, left)
+    matches = 0
+    for block in smaller:
+        b_y0, b_y1 = block["bbox"][1], block["bbox"][3]
+        for other in larger:
+            o_y0, o_y1 = other["bbox"][1], other["bbox"][3]
+            if min(b_y1, o_y1) - max(b_y0, o_y0) > 0:
+                matches += 1
+                break
+    return (matches / len(smaller)) >= COLUMN_SIBLING_MATCH_MIN_RATIO
+
+
+def detect_column_boundary_x(page_dict, page_height):
+    """Look at the page's own text-block bounding boxes for a genuine
+    column boundary - independent of (and far more reliable than) the OCR
+    text this function's caller is about to produce, because glyph
+    positions come from font metrics and stay valid even when a broken
+    ToUnicode CMap makes the extracted characters meaningless.
+
+    A single-column page (even a table-of-contents with a title and its
+    page number far apart on the same line) has each *block* spanning
+    close to the full text width - title and number are one continuous
+    run in the content stream. A genuinely multi-column page has separate,
+    narrower blocks per column, so their bounding boxes cluster into two
+    clearly-separated x0 groups instead. Running headers/footers are
+    excluded first since their bboxes are often oddly shaped (e.g. one
+    wide block spanning both a page number and a chapter title) and would
+    just add noise.
+
+    Returns a (left, right) PDF-point interval - the true empty gutter
+    between the two columns' blocks, NOT their midpoint, since a block's
+    own width is not symmetric around any single split point - or None for
+    what looks like a single-column page.
+    """
+    text_blocks = [
+        b for b in page_dict["blocks"]
+        if b["type"] == 0 and not is_in_margin_zone(b["bbox"][1], b["bbox"][3], page_height)
+    ]
+    if len(text_blocks) < 4:
+        return None
+    ordered = sorted(text_blocks, key=lambda b: b["bbox"][0])
+    gaps = [(ordered[i]["bbox"][0] - ordered[i - 1]["bbox"][0], i) for i in range(1, len(ordered))]
+    max_gap, split_at = max(gaps)
+    if max_gap < COLUMN_BOUNDARY_MIN_GAP_PT:
+        return None
+    other_gaps = [g for g, i in gaps if i != split_at]
+    if other_gaps:
+        median_other = sorted(other_gaps)[len(other_gaps) // 2]
+        if median_other > 0 and max_gap < median_other * COLUMN_SPLIT_GAP_RATIO:
+            return None
+
+    left, right = ordered[:split_at], ordered[split_at:]
+    # A genuine second column can be a single block of continuous running
+    # text (one block flowing down 24 lines, say) rather than several - the
+    # real protection against false positives (a sequential single-column
+    # page with varied indentation) is _blocks_run_in_parallel below, not
+    # the block count on either side.
+    if not left or not right:
+        return None
+    if not _blocks_run_in_parallel(left, right):
+        return None
+
+    gutter_left = max(b["bbox"][2] for b in left)
+    gutter_right = min(b["bbox"][0] for b in right)
+    if gutter_right <= gutter_left:
+        return None
+    return (gutter_left, gutter_right)
 
 
 def is_page_number_like(text):
@@ -612,6 +911,84 @@ def extract_block_text(block):
     return clean_text(extract_block_raw_text(block))
 
 
+def block_font_stats(block):
+    """Character-weighted average font size and bold fraction for a text
+    block's spans - a block usually has one dominant size/weight, but
+    weighting by character count (rather than just averaging span sizes)
+    keeps a short trailing superscript or footnote marker from skewing the
+    result of an otherwise uniform line."""
+    total_chars = 0
+    size_sum = 0.0
+    bold_chars = 0
+    for line in block.get("lines", []):
+        for span in line.get("spans", []):
+            text = span.get("text", "")
+            n = len(text)
+            if n == 0:
+                continue
+            total_chars += n
+            size_sum += span.get("size", 0.0) * n
+            if span.get("flags", 0) & 2 ** 4:
+                bold_chars += n
+    if total_chars == 0:
+        return 0.0, 0.0
+    return size_sum / total_chars, bold_chars / total_chars
+
+
+def compute_body_font_size(page_dict, page_height):
+    """The page's dominant (character-weighted modal) body font size, used
+    as the baseline headings are measured against - only trusted once seen
+    across a substantial amount of text (HEADING_BODY_SIZE_MIN_CHARS); a
+    title/colophon page has no real "body" to compare against, and a wrong
+    guess there would misclassify the whole page instead of nothing."""
+    sizes = {}
+    for block in page_dict["blocks"]:
+        if block["type"] != 0:
+            continue
+        if is_in_margin_zone(block["bbox"][1], block["bbox"][3], page_height):
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text.strip():
+                    continue
+                size = round(span.get("size", 0.0), 1)
+                sizes[size] = sizes.get(size, 0) + len(text)
+    if not sizes:
+        return None
+    size, count = max(sizes.items(), key=lambda item: item[1])
+    if count < HEADING_BODY_SIZE_MIN_CHARS:
+        return None
+    return size
+
+
+def classify_heading_level(text, block_size, bold_ratio, body_size):
+    """None, or a heading level (2/3) for a non-margin text block, based on
+    its font size relative to the page's body size (see
+    compute_body_font_size) - or, absent a size difference, a block that's
+    fully bold, close to body size, and short (a common styling for minor
+    subheadings that don't get a larger point size)."""
+    if body_size is None or block_size <= 0:
+        return None
+    if len(text) > HEADING_MAX_CHARS:
+        return None
+    stripped = text.rstrip()
+    if not stripped or stripped[-1] in PARAGRAPH_TERMINATOR_CHARS:
+        return None
+    ratio = block_size / body_size
+    if ratio >= HEADING_SIZE_RATIO_H2:
+        return 2
+    if ratio >= HEADING_SIZE_RATIO_H3:
+        return 3
+    if (
+        bold_ratio >= HEADING_BOLD_RATIO_MIN
+        and abs(ratio - 1.0) < HEADING_BOLD_SIZE_TOLERANCE
+        and len(text) <= HEADING_OCR_MAX_CHARS
+    ):
+        return 3
+    return None
+
+
 def dedup_running_heads(ordered_pages):
     """Suppress a running head (a non-page-number margin item, e.g. a
     chapter/section title) that's identical to the one on the immediately
@@ -639,10 +1016,14 @@ def dedup_running_heads(ordered_pages):
 
 def render_block_html(block):
     block_type = block["type"]
-    if block_type == "p":
-        return f"<p>{escape(block['text'])}</p>"
-    if block_type == "p_numeric":
-        return f'<p class="ocr-numbers">{escape(block["text"])}</p>'
+    if block_type in ("p", "p_numeric"):
+        css_class = "ocr-numbers" if block_type == "p_numeric" else None
+        style = f' style="margin-left:{block["indent_em"]}em"' if block.get("indent_em") else ""
+        class_attr = f' class="{css_class}"' if css_class else ""
+        return f"<p{class_attr}{style}>{escape(block['text'])}</p>"
+    if block_type == "h":
+        level = block["level"]
+        return f"<h{level}>{escape(block['text'])}</h{level}>"
     if block_type == "img":
         return f'<img src="{block["src"]}" alt="{escape(block["alt"])}" loading="lazy">'
     if block_type == "img_placeholder":
@@ -652,12 +1033,53 @@ def render_block_html(block):
     raise ValueError(f"unknown block type: {block_type}")
 
 
+def group_blocks_for_layout(blocks):
+    """Split a page's flat block list into render segments: consecutive
+    blocks with no "column" tag stay a single flowing sequence, while a
+    consecutive run of column-tagged blocks (see ocr_region_paragraphs)
+    becomes one side-by-side group, each column's blocks kept in their own
+    relative order. Blocks are already emitted in reading order (one
+    column fully, then the next), so grouping by tag alone - without
+    touching that order - is enough to lay genuinely parallel columns out
+    side by side instead of as one linear stream.
+
+    Returns a list of ("flow", [block, ...]) | ("columns", {index: [block, ...]}).
+    """
+    segments = []
+    i, n = 0, len(blocks)
+    while i < n:
+        if blocks[i].get("column") is None:
+            j = i
+            while j < n and blocks[j].get("column") is None:
+                j += 1
+            segments.append(("flow", blocks[i:j]))
+            i = j
+        else:
+            j = i
+            columns = {}
+            while j < n and blocks[j].get("column") is not None:
+                columns.setdefault(blocks[j]["column"], []).append(blocks[j])
+                j += 1
+            segments.append(("columns", columns))
+            i = j
+    return segments
+
+
 def render_page_html(page_data):
     parts = [f'<section class="page" id="page-{page_data["page_number"]}">']
     margin = page_data.get("margin_display", page_data["margin"])
     if margin:
         parts.append(f'<p class="page-meta">{escape(" · ".join(margin))}</p>')
-    parts.extend(render_block_html(b) for b in page_data["blocks"])
+    for kind, payload in group_blocks_for_layout(page_data["blocks"]):
+        if kind == "flow":
+            parts.extend(render_block_html(b) for b in payload)
+        else:
+            parts.append('<div class="cols">')
+            for col_index in sorted(payload):
+                parts.append('<div class="col">')
+                parts.extend(render_block_html(b) for b in payload[col_index])
+                parts.append("</div>")
+            parts.append("</div>")
     if page_data["callout"]:
         parts.append('<aside class="callout">')
         parts.extend(f"<p>{escape(t)}</p>" for t in page_data["callout"])
@@ -685,6 +1107,9 @@ def build_html_document(title, body_html):
         ".ocr-numbers{color:#aaa;font-style:italic;font-size:0.85em}",
         ".callout{border-left:3px solid #ccc;margin:1.2rem 0;padding:0.1rem 1rem;"
         "background:#fafafa;font-size:0.95em;color:#444}",
+        ".cols{display:flex;gap:2rem;margin:1rem 0}",
+        ".col{flex:1;min-width:0}",
+        "@media (max-width:700px){.cols{display:block}.col+.col{margin-top:1rem}}",
         "</style>",
         "</head>",
         "<body>",
@@ -696,15 +1121,49 @@ def build_html_document(title, body_html):
     return "\n".join(parts)
 
 
+MARKDOWN_INLINE_ESCAPE_RE = re.compile(r"([\\`*_\[\]<>&])")
+MARKDOWN_LEADING_DIGIT_RE = re.compile(r"^(\d+)\.(\s|$)")
+
+
+def escape_markdown(text):
+    """Escape characters CommonMark/GFM treats as syntax (emphasis, links,
+    code spans) or raw HTML/entities. Text pulled out of a document is not
+    markup - and an unescaped "<tag>" is the dangerous case: a book that
+    happens to mention an HTML tag by name (e.g. "<NOFRAMES>") produces a
+    literal, unclosed tag in the Markdown source, and most renderers then
+    treat *everything after it* as being inside that (never-closed)
+    element - for <noframes> specifically, browsers hide that content
+    outright, so the rendered page silently ends right there.
+    """
+    text = MARKDOWN_INLINE_ESCAPE_RE.sub(r"\\\1", text)
+    if text[:1] in "#-+":
+        text = "\\" + text
+    else:
+        match = MARKDOWN_LEADING_DIGIT_RE.match(text)
+        if match:
+            digits = match.group(1)
+            text = text[:len(digits)] + "\\." + text[len(digits) + 1:]
+    return text
+
+
+def escape_markdown_image_alt(text):
+    # Convert brackets instead of escaping them - a backslash-escaped "]"
+    # inside ![alt](src) risks confusing parsers about where alt ends.
+    text = text.replace("[", "(").replace("]", ")")
+    return re.sub(r"([\\`*_<>&])", r"\\\1", text)
+
+
 def render_block_markdown(block):
     block_type = block["type"]
     if block_type in ("p", "p_numeric"):
-        return block["text"]
+        return escape_markdown(block["text"])
+    if block_type == "h":
+        return ("#" * block["level"]) + " " + escape_markdown(block["text"])
     if block_type == "img":
-        alt = block["alt"].replace("[", "(").replace("]", ")")
-        return f'![{alt}]({block["src"]})'
+        return f'![{escape_markdown_image_alt(block["alt"])}]({block["src"]})'
     if block_type == "img_placeholder":
-        return f'*[Изображение: {block["caption"]}]*' if block["caption"] else "*[Изображение]*"
+        caption = escape_markdown(block["caption"]) if block["caption"] else None
+        return f'*[Изображение: {caption}]*' if caption else "*[Изображение]*"
     raise ValueError(f"unknown block type: {block_type}")
 
 
@@ -712,10 +1171,10 @@ def render_page_markdown(page_data):
     parts = []
     margin = page_data.get("margin_display", page_data["margin"])
     if margin:
-        parts.append(f'*{" · ".join(margin)}*')
+        parts.append(f'*{escape_markdown(" · ".join(margin))}*')
     parts.extend(render_block_markdown(b) for b in page_data["blocks"])
     if page_data["callout"]:
-        parts.append("\n".join(f"> {t}" for t in page_data["callout"]))
+        parts.append("\n".join(f"> {escape_markdown(t)}" for t in page_data["callout"]))
     return "\n\n".join(p for p in parts if p and p.strip())
 
 
@@ -726,7 +1185,7 @@ def build_markdown_document(title, page_mds):
 
 def render_block_txt(block):
     block_type = block["type"]
-    if block_type in ("p", "p_numeric"):
+    if block_type in ("p", "p_numeric", "h"):
         return block["text"]
     if block_type == "img":
         return f'[Изображение: {block["alt"]}]' if block["alt"] else "[Изображение]"
@@ -776,6 +1235,17 @@ def extract_image_block(page, block, page_number, image_index, images_dir, save_
     return {"type": "img_placeholder", "caption": caption}
 
 
+def _with_layout_fields(block, para):
+    """Carry an OCR paragraph's column/indent hints (see
+    ocr_region_paragraphs) onto its extracted block, if present - purely
+    additive rendering metadata that md/txt renderers ignore."""
+    if para.get("column") is not None:
+        block["column"] = para["column"]
+    if para.get("indent_em"):
+        block["indent_em"] = para["indent_em"]
+    return block
+
+
 def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, generate_alt,
                          caption_backend, use_gpu, lmstudio_url, lmstudio_model):
     """Extract one page's content into a format-independent structure: a
@@ -809,11 +1279,14 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
                 # instead of interleaved line-by-line into the main text.
                 callout_items.append(text)
             elif is_numeric_heavy(text):
-                blocks.append({"type": "p_numeric", "text": text})
+                blocks.append(_with_layout_fields({"type": "p_numeric", "text": text}, para))
+            elif para.get("heading_level"):
+                blocks.append(_with_layout_fields({"type": "h", "level": para["heading_level"], "text": text}, para))
             else:
-                blocks.append({"type": "p", "text": text})
+                blocks.append(_with_layout_fields({"type": "p", "text": text}, para))
     else:
         page_height = page.rect.height
+        body_size = compute_body_font_size(page_dict, page_height)
         for block in page_dict["blocks"]:
             if block["type"] != 0:
                 continue
@@ -822,6 +1295,11 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
                 continue
             if is_margin_text(block["bbox"][1], block["bbox"][3], page_height, text):
                 margin_items.extend(split_margin_number(text))
+                continue
+            block_size, bold_ratio = block_font_stats(block)
+            level = classify_heading_level(text, block_size, bold_ratio, body_size)
+            if level:
+                blocks.append({"type": "h", "level": level, "text": text})
             else:
                 blocks.append({"type": "p", "text": text})
 
