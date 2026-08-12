@@ -27,6 +27,7 @@ INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
 NIELSEN = INPUT_DIR / "Веб-дизайн книга Якоба Нильсена.pdf"
 KONOVALENKO = INPUT_DIR / "Konovalenko I. .NET-C#.pdf"
 NON_DESIGNERS = INPUT_DIR / "Non-Designers-Design-Book.pdf"
+RESUME = INPUT_DIR / "Oleksandr_Lopatnov_Resume.docx"
 
 CHECKS = []
 
@@ -91,6 +92,21 @@ def _(page_data):
         "ни один блок не получил indent_em - список TOC не должен быть плоским"
 
 
+@check(NIELSEN, 25, "запись оглавления не склеивается с соседней колонкой (нулевой запас gutter_right)")
+def _(page_data):
+    entry = next((b for b in page_data["blocks"] if "Листы стилей" in b.get("text", "")), None)
+    assert entry is not None, "пункт 'Листы стилей' не найден среди блоков"
+    assert "102" in entry["text"], (
+        "номер страницы '102' оторвался от своего заголовка 'Листы стилей' - "
+        "проверь классификацию строк по колонкам в ocr_region_paragraphs"
+    )
+    assert "Продвинутый пользователь" not in entry["text"], (
+        "текст ЛЕВОЙ колонки ('Продвинутый пользователь') склеился с ПРАВОЙ ('102 Листы стилей') - "
+        "regression в gutter_mid/ocr_region_paragraphs (короткий токен вроде номера страницы "
+        "у самого начала колонки садится вплотную к gutter_right без запаса на OCR-джиттер)"
+    )
+
+
 @check(NIELSEN, 28, "узкий межколоночный зазор не рвёт слово посередине")
 def _(page_data):
     combined = all_text(page_data)
@@ -129,6 +145,34 @@ def _(page_data):
         f"внешняя ссылка на peachpit.com не найдена среди {hrefs!r} - проверь find_page_links/_span_href"
     assert any(h.startswith("mailto:") for h in hrefs), \
         f"mailto: ссылка не найдена среди {hrefs!r}"
+
+
+def _hrefs(page_data):
+    return [
+        run.get("href")
+        for b in page_data["blocks"] if b["type"] == "p" and b.get("runs")
+        for run in b["runs"] if run.get("href")
+    ]
+
+
+@check(RESUME, 1, "голая строка 'linkedin.com/in/...' в .docx получает href из реальной ссылки")
+def _(page_data):
+    hrefs = _hrefs(page_data)
+    assert "https://www.linkedin.com/in/lopatnov/" in hrefs, (
+        f"ссылка на LinkedIn не найдена среди {hrefs!r} - голая строка "
+        "'linkedin.com/in/lopatnov' в тексте (без http:///www., BARE_URL_RE её не ловит) "
+        "должна получить href из реальной .docx-ссылки - проверь extract_docx_hyperlinks/"
+        "apply_known_hyperlinks"
+    )
+
+
+@check(RESUME, 6, "реальные .docx-гиперссылки восстанавливаются (page.get_links() для .docx всегда пуст)")
+def _(page_data):
+    hrefs = _hrefs(page_data)
+    assert "https://lopatnov.github.io/pressmark/" in hrefs, (
+        f"ссылка на pressmark не найдена среди {hrefs!r} - "
+        "проверь extract_docx_hyperlinks/apply_known_hyperlinks"
+    )
 
 
 @check(KONOVALENKO, 24, "курсив внутри абзаца ('налагоджувачем') сохраняется, а не отбрасывается")
@@ -196,6 +240,53 @@ def _(page_data):
         f"строка 'sbyte' расползлась по не тем колонкам: {sbyte_row!r} - проверь _merge_split_columns"
 
 
+def check_image_namespacing():
+    """Two different books converted into the SAME -o directory used to
+    silently overwrite each other's pictures: extract_image_block() named
+    files only by page_number/image_index inside one flat <output>/images/
+    folder shared across every book, so e.g. book A's page-79-image-1 and
+    book B's page-79-image-1 collided on disk and one book ended up
+    displaying the other's picture.
+
+    Standalone (not table-driven like CHECKS above) because it needs
+    save_images=True and its own tmp_dir, unlike every other check here
+    which shares one save_images=False run per book."""
+    label = "[namespacing] картинки сохраняются в подпапку images/<книга>/, а не в общую images/"
+    if not NON_DESIGNERS.exists():
+        print(f"ПРОПУСК {label}: книга недоступна")
+        return None
+    tmp_dir = Path(tempfile.mkdtemp(prefix="doc2html_imgtest_"))
+    try:
+        doc2html.convert_document(
+            NON_DESIGNERS, tmp_dir, save_images=True, generate_alt=False,
+            start_page=79, end_page=79, restart=True, clean_state=False,
+            out_format="html",
+        )
+        state_dir = doc2html.state_dir_for(tmp_dir, NON_DESIGNERS)
+        fragments = doc2html.read_existing_fragments(state_dir / "pages", 79)
+        page_data = fragments.get(79)
+        img_blocks = [b for b in page_data["blocks"] if b["type"] == "img"]
+        assert img_blocks, "ожидал хотя бы одну сохранённую картинку на странице 79"
+        book_dir = tmp_dir / "images" / NON_DESIGNERS.stem
+        assert book_dir.is_dir(), f"не нашёл {book_dir} - картинки должны лежать в подпапке на книгу"
+        for b in img_blocks:
+            assert b["src"].startswith(f"images/{NON_DESIGNERS.stem}/"), (
+                f"src={b['src']!r} не содержит подпапку книги - "
+                "проверь images_dir в convert_document/extract_image_block"
+            )
+            assert (tmp_dir / b["src"]).is_file(), f"файл {b['src']!r} не найден на диске"
+        print(f"OK      {label}")
+        return True
+    except AssertionError as exc:
+        print(f"ОШИБКА  {label}: {exc}")
+        return False
+    except Exception as exc:
+        print(f"ОШИБКА  {label}: неожиданное исключение {type(exc).__name__}: {exc}")
+        return False
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def main():
     tmp_dir = Path(tempfile.mkdtemp(prefix="doc2html_regression_"))
     try:
@@ -246,6 +337,14 @@ def main():
                 failed += 1
 
         ran = len(CHECKS) - skipped
+        namespacing_result = check_image_namespacing()
+        if namespacing_result is None:
+            skipped += 1
+        else:
+            ran += 1
+            if not namespacing_result:
+                failed += 1
+
         print(f"\n{ran - failed}/{ran} проверок пройдено" + (f" ({skipped} пропущено - книга недоступна)" if skipped else ""))
         return 1 if failed else 0
     finally:

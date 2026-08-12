@@ -26,8 +26,10 @@ import sys
 import unicodedata
 import urllib.error
 import urllib.request
+import zipfile
 from html import escape
 from pathlib import Path
+from xml.etree import ElementTree
 
 import pymupdf
 
@@ -751,8 +753,18 @@ def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0, gutter=None
         column_groups = [(None, rows)]
     else:
         gutter_left, gutter_right = gutter
-        left = sorted((r for r in rows if r["x0"] < gutter_right), key=lambda r: (r["y0"] + r["y1"]) / 2)
-        right = sorted((r for r in rows if r["x0"] >= gutter_right), key=lambda r: (r["y0"] + r["y1"]) / 2)
+        # The midpoint, not either raw edge: a row's x0 is where its own
+        # text starts, so a right-column row's x0 sits flush against
+        # gutter_right by construction (that edge IS the right column's own
+        # leftmost content, e.g. a lone leading page number like "102" in a
+        # table-of-contents entry) - comparing against gutter_right leaves
+        # zero margin for ordinary OCR bbox jitter and misclassifies such
+        # rows into the left column, splicing unrelated columns' text
+        # together. The midpoint gives roughly equal tolerance on both
+        # sides instead.
+        gutter_mid = (gutter_left + gutter_right) / 2
+        left = sorted((r for r in rows if r["x0"] < gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
+        right = sorted((r for r in rows if r["x0"] >= gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
         column_groups = [(idx, group) for idx, group in enumerate((left, right)) if group]
 
     paragraphs = []
@@ -1353,6 +1365,119 @@ def linkify_markdown(text):
     return escape_markdown_leading_guard("".join(parts))
 
 
+DOCX_RELS_NS = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+DOCX_W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+DOCX_R_NS = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+
+
+def extract_docx_hyperlinks(input_path):
+    """(display text -> href) for every real hyperlink in a .docx file,
+    parsed directly from its OOXML parts (word/document.xml + word/_rels/
+    document.xml.rels).
+
+    Unlike a PDF, PyMuPDF opens a .docx by reflowing it into page-shaped
+    text with no equivalent of a link annotation - page.get_links() (see
+    find_page_links) always comes back empty, so a Word document's real
+    hyperlinks (mailto:, project/portfolio links, ...) are otherwise
+    silently dropped entirely rather than just missing an href on text
+    that's already there. {} for anything that isn't a .docx, or on any
+    parse failure - this is a best-effort recovery, not something that
+    should ever fail the conversion itself.
+    """
+    if input_path.suffix.lower() != ".docx":
+        return {}
+    try:
+        with zipfile.ZipFile(input_path) as archive:
+            rels_xml = archive.read("word/_rels/document.xml.rels")
+            doc_xml = archive.read("word/document.xml")
+        rel_targets = {
+            rel.get("Id"): rel.get("Target")
+            for rel in ElementTree.fromstring(rels_xml).iter(f"{DOCX_RELS_NS}Relationship")
+            if rel.get("TargetMode") == "External"
+        }
+        hyperlinks = {}
+        for hl in ElementTree.fromstring(doc_xml).iter(f"{DOCX_W_NS}hyperlink"):
+            href = rel_targets.get(hl.get(f"{DOCX_R_NS}id"))
+            if not href:
+                continue
+            display = "".join(t.text or "" for t in hl.iter(f"{DOCX_W_NS}t")).strip()
+            if display:
+                hyperlinks[display] = href
+        return hyperlinks
+    except (OSError, KeyError, ElementTree.ParseError):
+        return {}
+
+
+def _split_run_on_known_phrases(run, hyperlink_map):
+    """(new_runs, matched) - run split at every non-overlapping occurrence
+    of a hyperlink_map phrase, each piece inheriting run's bold/italic/
+    superscript; matched pieces get that phrase's href. Longer phrases win
+    ties at the same start position (e.g. a project name that happens to
+    be a prefix of another one) - matched=False, [run] unchanged when
+    nothing in this run's text matches any known phrase."""
+    text = run["text"]
+    matches = []
+    for phrase, href in hyperlink_map.items():
+        start = 0
+        while True:
+            idx = text.find(phrase, start)
+            if idx == -1:
+                break
+            matches.append((idx, idx + len(phrase), href))
+            start = idx + len(phrase)
+    if not matches:
+        return [run], False
+
+    matches.sort(key=lambda m: (m[0], -(m[1] - m[0])))
+    pieces, cursor = [], 0
+    for m_start, m_end, href in matches:
+        if m_start < cursor:
+            continue
+        if m_start > cursor:
+            pieces.append((cursor, m_start, None))
+        pieces.append((m_start, m_end, href))
+        cursor = m_end
+    if cursor < len(text):
+        pieces.append((cursor, len(text), None))
+
+    new_runs = [
+        {"text": text[s:e], "bold": run["bold"], "italic": run["italic"],
+         "superscript": run["superscript"], "href": href}
+        for s, e, href in pieces if text[s:e]
+    ]
+    return new_runs, True
+
+
+def apply_known_hyperlinks(blocks, hyperlink_map):
+    """Inject hrefs from hyperlink_map (see extract_docx_hyperlinks) into
+    any block whose text contains one of its known display-text phrases
+    verbatim - the recovery path for formats (currently just .docx) where
+    a real link object can't be read back from PyMuPDF at all. Works at
+    the run level (synthesizing a single plain run first if the block has
+    none yet) so it splits/extends whatever bold/italic runs extraction
+    already found instead of overwriting them.
+    """
+    if not hyperlink_map:
+        return
+    for block in blocks:
+        if block.get("type") not in ("p", "li") or not block.get("text"):
+            continue
+        base_runs = block.get("runs") or [
+            {"text": block["text"], "bold": False, "italic": False, "superscript": False, "href": None}
+        ]
+        new_runs = []
+        matched_any = False
+        for run in base_runs:
+            if run.get("href"):
+                new_runs.append(run)
+                continue
+            pieces, matched = _split_run_on_known_phrases(run, hyperlink_map)
+            new_runs.extend(pieces)
+            matched_any = matched_any or matched
+        if matched_any:
+            block["runs"] = new_runs
+
+
 def render_runs_html(runs):
     parts = []
     for run in runs:
@@ -1709,7 +1834,11 @@ def extract_image_block(page, block, page_number, image_index, images_dir, save_
     if save_images:
         filename = f"image_{page_number:04d}_{image_index:04d}.png"
         (images_dir / filename).write_bytes(image_bytes)
-        return {"type": "img", "src": f"images/{filename}", "alt": caption or ""}
+        # images_dir is output_dir/"images"/<book stem> (see convert_document) -
+        # a flat shared images/ folder collided page_number+image_index across
+        # different books converted into the same -o output directory, silently
+        # overwriting one book's picture with another's.
+        return {"type": "img", "src": f"images/{images_dir.name}/{filename}", "alt": caption or ""}
     return {"type": "img_placeholder", "caption": caption}
 
 
@@ -2262,7 +2391,11 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
                       caption_backend="blip", use_gpu=None, out_format="html",
                       lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
     output_dir = Path(output_dir)
-    images_dir = output_dir / "images"
+    # Scoped per book (not a flat shared images/), so converting two
+    # different books into the same -o directory can't have one book's
+    # image silently overwrite another's on a matching page_number+image_index
+    # (see extract_image_block).
+    images_dir = output_dir / "images" / input_path.stem
     output_dir.mkdir(parents=True, exist_ok=True)
     if save_images:
         images_dir.mkdir(parents=True, exist_ok=True)
@@ -2303,6 +2436,7 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
         )
 
     out_file = output_dir / f"{input_path.stem}.{out_format}"
+    docx_hyperlinks = extract_docx_hyperlinks(input_path)
 
     pages_since_assemble = 0
     assembled_once = False
@@ -2317,6 +2451,7 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
             page, page_dict, page_number, images_dir, save_images, generate_alt,
             caption_backend, resolved_gpu, lmstudio_url, lmstudio_model,
         )
+        apply_known_hyperlinks(page_data["blocks"], docx_hyperlinks)
 
         fragments[page_number] = page_data
         write_fragment(pages_dir, page_number, page_data)
