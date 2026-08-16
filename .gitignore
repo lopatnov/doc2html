@@ -3,6 +3,7 @@
 __pycache__/
 *.log
 /scratchpad*.json
+/.claude/worktrees/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
@@ -227,3 +228,4 @@ __marimo__/
 __pycache__/
 *.log
 /scratchpad*.json
+/.claude/worktrees/
