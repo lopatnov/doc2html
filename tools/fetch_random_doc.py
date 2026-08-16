@@ -22,12 +22,25 @@ import json
 import random
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 GUTENDEX_BOOK_URL = "https://gutendex.com/books/{book_id}"
 MAX_GUTENBERG_ID = 75000
 USER_AGENT = "doc2html-random-doc-fetcher/1.0 (+https://github.com/lopatnov/doc2html)"
+
+# Gutendex's "formats" field hands back a download URL taken from its own
+# catalog data, not something we should treat as trusted - restrict where we
+# will actually fetch a file from to Gutenberg's own hosts (allowlist, not a
+# blocklist) so a compromised/malicious API response can't redirect us into
+# fetching an arbitrary URL (SSRF).
+ALLOWED_DOWNLOAD_HOSTS = {"www.gutenberg.org", "gutenberg.org"}
+
+
+def is_allowed_download_url(url):
+    parsed = urllib.parse.urlparse(url)
+    return parsed.scheme == "https" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
 
 # Ordered by how well doc2html.py (via PyMuPDF) handles them for QA purposes.
 PREFERRED_MIME_PREFIXES = [
@@ -96,6 +109,9 @@ def main():
         formats = data.get("formats", {})
         mime_prefix, format_key, url = pick_format(formats)
         if not url:
+            continue
+        if not is_allowed_download_url(url):
+            print(f"attempt {attempt}: refusing non-Gutenberg download URL {url!r} for id {book_id}", file=sys.stderr)
             continue
 
         ext = EXTENSION_BY_MIME_PREFIX[mime_prefix]
