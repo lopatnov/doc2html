@@ -60,20 +60,31 @@ def normalize_download_url(url):
     return url
 
 
-class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
-    """urlopen() follows redirects by default without re-checking them
-    against ALLOWED_DOWNLOAD_HOSTS, so a same-host response could still
-    redirect us to an arbitrary URL (SSRF). Refuse every redirect instead -
-    neither Gutendex's API nor Gutenberg's direct file URLs need one for
-    our purposes, so treating any 3xx as a hard failure for that attempt
-    is simpler and safer than re-validating each hop.
+def _make_allowlisted_redirect_handler(allowed_hosts):
+    """A urllib redirect handler that re-validates *every* hop against
+    allowed_hosts (https + exact hostname) instead of trusting urlopen()'s
+    default behavior of blindly following redirects. First version of this
+    refused all redirects outright, which turned out to break the normal
+    case too: Gutendex's REST API (Django-style) 301-redirects
+    /books/{id} -> /books/{id}/ on every request, same host - confirmed by
+    running the real workflow, where all 20 attempts failed with
+    "HTTP 301" before this fix existed. Allowlisting the host (rather than
+    just accepting "same as request") still blocks a same-host response
+    from redirecting off-host to an attacker-controlled server (SSRF).
     """
 
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
+    class _AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            parsed = urllib.parse.urlparse(newurl)
+            if parsed.scheme == "https" and parsed.hostname in allowed_hosts:
+                return super().redirect_request(req, fp, code, msg, headers, newurl)
+            raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
+
+    return _AllowlistedRedirectHandler
 
 
-_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+_API_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler({"gutendex.com"}))
+_DOWNLOAD_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler(ALLOWED_DOWNLOAD_HOSTS))
 
 # Ordered by how well doc2html.py (via PyMuPDF) handles them for QA purposes.
 PREFERRED_MIME_PREFIXES = [
@@ -108,7 +119,7 @@ def _read_capped(resp, max_bytes):
 
 def fetch_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _OPENER.open(req, timeout=timeout) as resp:
+    with _API_OPENER.open(req, timeout=timeout) as resp:
         return json.loads(_read_capped(resp, MAX_RESPONSE_BYTES))
 
 
@@ -119,7 +130,7 @@ def download(url, dest, timeout=60):
     attempt's `git add random_doc` to pick up and publish by accident.
     """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _OPENER.open(req, timeout=timeout) as resp:
+    with _DOWNLOAD_OPENER.open(req, timeout=timeout) as resp:
         data = _read_capped(resp, MAX_RESPONSE_BYTES)
     temp_dest = dest.with_name(f".{dest.name}.part")
     try:
