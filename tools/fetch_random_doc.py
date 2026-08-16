@@ -36,11 +36,16 @@ USER_AGENT = "doc2html-random-doc-fetcher/1.0 (+https://github.com/lopatnov/doc2
 # blocklist) so a compromised/malicious API response can't redirect us into
 # fetching an arbitrary URL (SSRF).
 ALLOWED_DOWNLOAD_HOSTS = {"www.gutenberg.org", "gutenberg.org"}
+MAX_RESPONSE_BYTES = 200 * 1024 * 1024  # generous cap for even a large scanned-page epub/pdf
 
 
 def is_allowed_download_url(url):
     parsed = urllib.parse.urlparse(url)
-    return parsed.scheme == "https" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
+    return (
+        parsed.scheme == "https"
+        and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
+        and parsed.port is None  # reject an explicit non-default port, e.g. gutenberg.org:8081
+    )
 
 
 def normalize_download_url(url):
@@ -83,16 +88,36 @@ EXTENSION_BY_MIME_PREFIX = {
 }
 
 
+def _read_capped(resp, max_bytes):
+    """Read at most max_bytes+1 from resp - the +1 lets the caller tell
+    "exactly at the cap" apart from "went over" without reading unbounded
+    data first. Guards against a malicious/broken response streaming an
+    unbounded body at us (runner disk/memory exhaustion)."""
+    chunks = []
+    total = 0
+    while total <= max_bytes:
+        chunk = resp.read(1024 * 1024)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    if total > max_bytes:
+        raise ValueError(f"response exceeded {max_bytes} byte cap")
+    return b"".join(chunks)
+
+
 def fetch_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with _OPENER.open(req, timeout=timeout) as resp:
-        return json.load(resp)
+        return json.loads(_read_capped(resp, MAX_RESPONSE_BYTES))
 
 
 def download(url, dest, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _OPENER.open(req, timeout=timeout) as resp, open(dest, "wb") as f:
-        f.write(resp.read())
+    with _OPENER.open(req, timeout=timeout) as resp:
+        data = _read_capped(resp, MAX_RESPONSE_BYTES)
+    with open(dest, "wb") as f:
+        f.write(data)
 
 
 def resolve_out_dir(raw_out_dir):
@@ -179,9 +204,16 @@ def try_fetch_book(book_id, attempt, out_dir):
     return True
 
 
+def positive_int_up_to_200(raw):
+    value = int(raw)
+    if not 1 <= value <= 200:
+        raise argparse.ArgumentTypeError("--max-attempts must be between 1 and 200")
+    return value
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--max-attempts", type=int, default=20)
+    parser.add_argument("--max-attempts", type=positive_int_up_to_200, default=20)
     parser.add_argument("--out-dir", default="random_doc")
     args = parser.parse_args()
 
