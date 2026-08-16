@@ -19,7 +19,7 @@ caller can treat this run as "no document found" rather than crash.
 """
 import argparse
 import json
-import random
+import secrets
 import sys
 import urllib.error
 import urllib.parse
@@ -42,6 +42,34 @@ def is_allowed_download_url(url):
     parsed = urllib.parse.urlparse(url)
     return parsed.scheme == "https" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
 
+
+def normalize_download_url(url):
+    """Upgrade http -> https for a recognized Gutenberg host (Gutendex
+    sometimes hands back http:// links). Never downgrades; anything else
+    is returned unchanged and left for is_allowed_download_url to reject.
+    """
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme == "http" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS:
+        parsed = parsed._replace(scheme="https")
+        return urllib.parse.urlunparse(parsed)
+    return url
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urlopen() follows redirects by default without re-checking them
+    against ALLOWED_DOWNLOAD_HOSTS, so a same-host response could still
+    redirect us to an arbitrary URL (SSRF). Refuse every redirect instead -
+    neither Gutendex's API nor Gutenberg's direct file URLs need one for
+    our purposes, so treating any 3xx as a hard failure for that attempt
+    is simpler and safer than re-validating each hop.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
 # Ordered by how well doc2html.py (via PyMuPDF) handles them for QA purposes.
 PREFERRED_MIME_PREFIXES = [
     "application/epub+zip",
@@ -57,14 +85,29 @@ EXTENSION_BY_MIME_PREFIX = {
 
 def fetch_json(url, timeout=15):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
+    with _OPENER.open(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
 def download(url, dest, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=timeout) as resp, open(dest, "wb") as f:
+    with _OPENER.open(req, timeout=timeout) as resp, open(dest, "wb") as f:
         f.write(resp.read())
+
+
+def resolve_out_dir(raw_out_dir):
+    """Resolve --out-dir and reject anything that escapes the current
+    working directory (e.g. via ../.. segments or an absolute path
+    elsewhere), since this value comes straight from an unvalidated CLI
+    argument and every filesystem write in this script is derived from it.
+    """
+    base = Path.cwd().resolve()
+    resolved = (base / raw_out_dir).resolve()
+    try:
+        resolved.relative_to(base)
+    except ValueError:
+        raise SystemExit(f"--out-dir must resolve to a path inside {base} (got {resolved})")
+    return resolved
 
 
 def pick_format(formats):
@@ -75,74 +118,88 @@ def pick_format(formats):
     return None, None, None
 
 
+def write_metadata(out_dir, book_id, attempt, data, format_key, url, dest):
+    metadata = {
+        "source": "Project Gutenberg (via gutendex.com API)",
+        "gutenberg_id": book_id,
+        "gutenberg_book_url": f"https://www.gutenberg.org/ebooks/{book_id}",
+        "title": data.get("title"),
+        "authors": [a.get("name") for a in data.get("authors", [])],
+        "license_basis": (
+            "Gutendex reports copyright=false for this book (public domain "
+            "in the US); the downloaded file is also covered by the Project "
+            "Gutenberg License, see https://www.gutenberg.org/policy/license.html"
+        ),
+        "format_mime": format_key,
+        "format_url": url,
+        "local_file": dest.name,
+        "attempt": attempt,
+    }
+    (out_dir / "metadata.json").write_text(
+        json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def try_fetch_book(book_id, attempt, out_dir):
+    """Try one candidate Gutenberg id. Returns True and writes the book +
+    metadata.json into out_dir on success, False if this id should be
+    skipped in favor of another random attempt."""
+    try:
+        data = fetch_json(GUTENDEX_BOOK_URL.format(book_id=book_id))
+    except urllib.error.HTTPError as exc:
+        if exc.code != 404:
+            print(f"attempt {attempt}: HTTP {exc.code} for id {book_id}", file=sys.stderr)
+        return False
+    except Exception as exc:
+        print(f"attempt {attempt}: error {exc} for id {book_id}", file=sys.stderr)
+        return False
+
+    if data.get("copyright") is not False:
+        # False = confirmed public domain in the US per Gutendex.
+        # None (unknown) or True (copyrighted) are both too risky to use.
+        return False
+
+    mime_prefix, format_key, url = pick_format(data.get("formats", {}))
+    if not url:
+        return False
+    url = normalize_download_url(url)
+    if not is_allowed_download_url(url):
+        print(f"attempt {attempt}: refusing non-Gutenberg download URL {url!r} for id {book_id}", file=sys.stderr)
+        return False
+
+    dest = out_dir / f"gutenberg_{book_id}{EXTENSION_BY_MIME_PREFIX[mime_prefix]}"
+    try:
+        download(url, dest)
+    except Exception as exc:
+        print(f"attempt {attempt}: download failed for id {book_id}: {exc}", file=sys.stderr)
+        return False
+
+    write_metadata(out_dir, book_id, attempt, data, format_key, url, dest)
+    print(f"OK: picked '{data.get('title')}' (Gutenberg id {book_id}) -> {dest}")
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--max-attempts", type=int, default=20)
     parser.add_argument("--out-dir", default="random_doc")
     args = parser.parse_args()
 
-    out_dir = Path(args.out_dir)
+    out_dir = resolve_out_dir(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     tried_ids = set()
-    for attempt in range(1, args.max_attempts + 1):
-        book_id = random.randint(1, MAX_GUTENBERG_ID)
+    attempt = 0
+    while attempt < args.max_attempts:
+        book_id = secrets.randbelow(MAX_GUTENBERG_ID) + 1
         if book_id in tried_ids:
+            # Doesn't count as a real attempt - no API call was made for it.
             continue
         tried_ids.add(book_id)
+        attempt += 1
 
-        try:
-            data = fetch_json(GUTENDEX_BOOK_URL.format(book_id=book_id))
-        except urllib.error.HTTPError as exc:
-            if exc.code != 404:
-                print(f"attempt {attempt}: HTTP {exc.code} for id {book_id}", file=sys.stderr)
-            continue
-        except Exception as exc:
-            print(f"attempt {attempt}: error {exc} for id {book_id}", file=sys.stderr)
-            continue
-
-        if data.get("copyright") is not False:
-            # False = confirmed public domain in the US per Gutendex.
-            # None (unknown) or True (copyrighted) are both too risky to use.
-            continue
-
-        formats = data.get("formats", {})
-        mime_prefix, format_key, url = pick_format(formats)
-        if not url:
-            continue
-        if not is_allowed_download_url(url):
-            print(f"attempt {attempt}: refusing non-Gutenberg download URL {url!r} for id {book_id}", file=sys.stderr)
-            continue
-
-        ext = EXTENSION_BY_MIME_PREFIX[mime_prefix]
-        dest = out_dir / f"gutenberg_{book_id}{ext}"
-        try:
-            download(url, dest)
-        except Exception as exc:
-            print(f"attempt {attempt}: download failed for id {book_id}: {exc}", file=sys.stderr)
-            continue
-
-        metadata = {
-            "source": "Project Gutenberg (via gutendex.com API)",
-            "gutenberg_id": book_id,
-            "gutenberg_book_url": f"https://www.gutenberg.org/ebooks/{book_id}",
-            "title": data.get("title"),
-            "authors": [a.get("name") for a in data.get("authors", [])],
-            "license_basis": (
-                "Gutendex reports copyright=false for this book (public domain "
-                "in the US); the downloaded file is also covered by the Project "
-                "Gutenberg License, see https://www.gutenberg.org/policy/license.html"
-            ),
-            "format_mime": format_key,
-            "format_url": url,
-            "local_file": dest.name,
-            "attempt": attempt,
-        }
-        (out_dir / "metadata.json").write_text(
-            json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        print(f"OK: picked '{data.get('title')}' (Gutenberg id {book_id}) -> {dest}")
-        return 0
+        if try_fetch_book(book_id, attempt, out_dir):
+            return 0
 
     print(f"FAILED: no usable public-domain document found in {args.max_attempts} attempts", file=sys.stderr)
     return 1
