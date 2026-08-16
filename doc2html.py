@@ -119,6 +119,12 @@ TABLE_BLOCK_OVERLAP_MIN_RATIO = 0.5
 # vector-graphics callout box (see find_callout_boxes) when this much of
 # its own area sits inside the box's bbox.
 CALLOUT_BLOCK_OVERLAP_MIN_RATIO = 0.5
+# detect_callout_column_boundary_x(): a block spanning more than this
+# fraction of the callout box's own width is its title/header bar (drawn
+# across both internal columns, if the callout happens to have any), not a
+# column - genuine per-column blocks in a two-column callout come in at
+# roughly half the box width each.
+CALLOUT_TITLE_WIDTH_RATIO = 0.6
 # page.find_tables() often over-segments into spurious all-empty columns
 # and turns a wrapped multi-line cell into an extra almost-empty row - a
 # detected table is only trusted once cleaned down to at least this many
@@ -835,7 +841,16 @@ def ocr_page_regions(page, page_dict, use_gpu):
     for box in callout_boxes:
         clip_pixmap = page.get_pixmap(clip=box, dpi=OCR_RENDER_DPI)
         clip_image = Image.open(io.BytesIO(clip_pixmap.tobytes("png"))).convert("RGB")
-        for para in ocr_region_paragraphs(reader, clip_image, box.x0 * scale, box.y0 * scale):
+        # A callout can be internally two-column on its own, independent of
+        # whether the surrounding page is (see detect_callout_column_
+        # boundary_x) - without this, the box gets OCR'd as one flow and a
+        # two-column callout's text comes out interleaved into nonsense.
+        callout_boundary_pt = detect_callout_column_boundary_x(page_dict, box)
+        callout_gutter = (
+            (callout_boundary_pt[0] * scale, callout_boundary_pt[1] * scale)
+            if callout_boundary_pt is not None else None
+        )
+        for para in ocr_region_paragraphs(reader, clip_image, box.x0 * scale, box.y0 * scale, gutter=callout_gutter):
             para["region"] = 1
             paragraphs.append(para)
 
@@ -971,7 +986,18 @@ def detect_column_boundary_x(page_dict, page_height, callout_boxes=None):
                     return True
             return False
         text_blocks = [b for b in text_blocks if not _in_callout(b)]
-    if len(text_blocks) < 4:
+    return _find_column_gap(text_blocks)
+
+
+def _find_column_gap(text_blocks, min_blocks=4):
+    """Shared core of detect_column_boundary_x/detect_callout_column_
+    boundary_x: given an already-filtered set of text blocks, look for two
+    x0-separated groups running in parallel and return their (left, right)
+    gutter interval, or None. min_blocks guards against reading noise as
+    columns on too few blocks - the full page needs several per side to
+    trust a split (see detect_column_boundary_x), but a callout box is
+    small enough that one block per column is normal, not noise."""
+    if len(text_blocks) < min_blocks:
         return None
     ordered = sorted(text_blocks, key=lambda b: b["bbox"][0])
     gaps = [(ordered[i]["bbox"][0] - ordered[i - 1]["bbox"][0], i) for i in range(1, len(ordered))]
@@ -1000,6 +1026,39 @@ def detect_column_boundary_x(page_dict, page_height, callout_boxes=None):
     if gutter_right <= gutter_left:
         return None
     return (gutter_left, gutter_right)
+
+
+def detect_callout_column_boundary_x(page_dict, box):
+    """Like detect_column_boundary_x, but scoped to one callout/sidebar
+    box's own contents instead of the page's main flow.
+
+    A callout can independently be laid out in its own two internal
+    columns regardless of whether the surrounding page is single- or
+    multi-column (a book design choice orthogonal to the main flow's own
+    layout) - see the caller in ocr_page_regions, which otherwise OCRs the
+    whole box as one undifferentiated region and, on a two-column callout,
+    ends up interleaving both columns' text into nonsense. Its own title/
+    header bar (typically drawn across the full box width, above the
+    columns) is excluded first via CALLOUT_TITLE_WIDTH_RATIO - included,
+    it reads as an oversized "left column" and throws off the gutter math.
+    """
+    text_blocks = []
+    for b in page_dict["blocks"]:
+        if b["type"] != 0:
+            continue
+        block_rect = pymupdf.Rect(b["bbox"])
+        block_area = block_rect.width * block_rect.height
+        if block_area <= 0:
+            continue
+        overlap = block_rect & box
+        if overlap.is_empty:
+            continue
+        if (overlap.width * overlap.height) / block_area <= CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
+            continue
+        if box.width > 0 and block_rect.width > box.width * CALLOUT_TITLE_WIDTH_RATIO:
+            continue
+        text_blocks.append(b)
+    return _find_column_gap(text_blocks, min_blocks=2)
 
 
 def is_page_number_like(text):

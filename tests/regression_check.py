@@ -76,6 +76,25 @@ def _(page_data):
     assert page_data.get("callout"), "ожидалась непустая врезка (callout) на странице 11"
 
 
+@check(NIELSEN, 42, "двухколоночная врезка не рассыпается в перемешанный текст")
+def _(page_data):
+    callout = page_data.get("callout", [])
+    combined = " ".join(callout)
+    assert "учитывать" in combined and "мониторов" in combined, (
+        f"текст левой колонки врезки не найден целиком в {callout!r} - "
+        "проверь detect_callout_column_boundary_x"
+    )
+    assert "Большинство задач выполняется" in combined, (
+        f"текст правой колонки врезки не найден целиком в {callout!r} - "
+        "проверь detect_callout_column_boundary_x"
+    )
+    for bad in ("отывать тex", "тельности. Большинство задач выполняется отывать"):
+        assert bad not in combined, (
+            f"регрессия: колонки врезки снова перемешались ({bad!r} найдено в тексте) - "
+            "проверь gutter в вызове ocr_region_paragraphs для callout_boxes"
+        )
+
+
 @check(NIELSEN, 22, "нет фрагментации оправданного (justified) текста на отдельные слова")
 def _(page_data):
     combined = all_text(page_data)
