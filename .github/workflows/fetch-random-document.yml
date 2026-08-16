@@ -30,7 +30,9 @@ jobs:
           python-version: "3.x"
 
       - name: Fetch a random public-domain document
-        run: python3 tools/fetch_random_doc.py --max-attempts "${{ github.event.inputs.max_attempts || '20' }}"
+        env:
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts }}
+        run: python3 tools/fetch_random_doc.py --max-attempts "${MAX_ATTEMPTS:-20}"
 
       - name: Publish to random-doc-inbox branch
         env:
