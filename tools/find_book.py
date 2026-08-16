@@ -32,11 +32,9 @@ Not part of the committed regression suite and not invoked by /maintain -
 this is a convenience tool for building your own local input/ collection.
 """
 import argparse
-import json
+import secrets
 import sys
-import urllib.error
 import urllib.parse
-import urllib.request
 from pathlib import Path
 
 try:
@@ -48,20 +46,15 @@ except ImportError:
     )
     raise SystemExit(1)
 
-GUTENDEX_API_HOST = "gutendex.com"
+import gutenberg_http
+
 GUTENDEX_BOOKS_URL = "https://gutendex.com/books"
 ALLOWED_DOWNLOAD_HOSTS = {"www.gutenberg.org", "gutenberg.org"}
-USER_AGENT = "doc2html-find-book/1.0 (+https://github.com/lopatnov/doc2html)"
-MAX_RESPONSE_BYTES = 200 * 1024 * 1024
+MAX_GUTENBERG_ID = 75000
 INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
 
-# Ordered by how well doc2html.py (via PyMuPDF) handles them.
-PREFERRED_MIME_PREFIXES = ["application/epub+zip", "application/pdf", "text/html"]
-EXTENSION_BY_MIME_PREFIX = {
-    "application/epub+zip": ".epub",
-    "application/pdf": ".pdf",
-    "text/html": ".html",
-}
+_API_OPENER = gutenberg_http.build_opener({"gutendex.com"})
+_DOWNLOAD_OPENER = gutenberg_http.build_opener(ALLOWED_DOWNLOAD_HOSTS)
 
 COMMON_LANGUAGES = [
     ("en", "английский"),
@@ -85,72 +78,6 @@ SORT_CHOICES = [
     ("ascending", "по номеру в каталоге Gutenberg, по возрастанию"),
     ("descending", "по номеру в каталоге Gutenberg, по убыванию"),
 ]
-
-
-# --- safe HTTP helpers (same allowlist/redirect/size-cap approach as
-# tools/fetch_random_doc.py - this script also talks to the real internet
-# from wherever you run it, so the same SSRF/size hygiene applies) ---
-
-
-def _make_allowlisted_redirect_handler(allowed_hosts):
-    class _Handler(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            parsed = urllib.parse.urlparse(newurl)
-            if parsed.scheme == "https" and parsed.hostname in allowed_hosts:
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
-            raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
-
-    return _Handler
-
-
-_API_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler({GUTENDEX_API_HOST}))
-_DOWNLOAD_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler(ALLOWED_DOWNLOAD_HOSTS))
-
-
-def _read_capped(resp, max_bytes):
-    chunks = []
-    total = 0
-    while total <= max_bytes:
-        chunk = resp.read(1024 * 1024)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    if total > max_bytes:
-        raise ValueError(f"response exceeded {max_bytes} byte cap")
-    return b"".join(chunks)
-
-
-def fetch_json(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _API_OPENER.open(req, timeout=timeout) as resp:
-        return json.loads(_read_capped(resp, MAX_RESPONSE_BYTES))
-
-
-def is_allowed_download_url(url):
-    parsed = urllib.parse.urlparse(url)
-    return parsed.scheme == "https" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS and parsed.port is None
-
-
-def download(url, dest, timeout=60):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _DOWNLOAD_OPENER.open(req, timeout=timeout) as resp:
-        data = _read_capped(resp, MAX_RESPONSE_BYTES)
-    temp_dest = dest.with_name(f".{dest.name}.part")
-    try:
-        with open(temp_dest, "wb") as f:
-            f.write(data)
-        temp_dest.replace(dest)
-    finally:
-        temp_dest.unlink(missing_ok=True)
-
-
-def pick_format(formats):
-    for mime_prefix in PREFERRED_MIME_PREFIXES:
-        for key, url in formats.items():
-            if key.startswith(mime_prefix):
-                return mime_prefix, key, url
-    return None, None, None
 
 
 # --- small input helpers on top of questionary ---
@@ -218,20 +145,17 @@ def gutenberg_page_url(book_id):
 
 def run_random_flow():
     count = ask_int("Сколько случайных книг скачать?", default=1)
-    import secrets
-
-    max_id = 75000
     picked = []
     tried = set()
     attempts = 0
     while len(picked) < count and attempts < count * 25:
         attempts += 1
-        book_id = secrets.randbelow(max_id) + 1
+        book_id = secrets.randbelow(MAX_GUTENBERG_ID) + 1
         if book_id in tried:
             continue
         tried.add(book_id)
         try:
-            book = fetch_json(f"{GUTENDEX_BOOKS_URL}/{book_id}")
+            book = gutenberg_http.fetch_json(_API_OPENER, f"{GUTENDEX_BOOKS_URL}/{book_id}")
         except Exception:
             continue
         if book.get("copyright") is not False:
@@ -271,7 +195,7 @@ def run_filtered_flow():
 
     url = build_query(topic, author, year_from, year_to, languages, sort)
     try:
-        data = fetch_json(url)
+        data = gutenberg_http.fetch_json(_API_OPENER, url)
     except Exception as exc:
         print(f"Не удалось обратиться к Gutendex: {exc}", file=sys.stderr)
         return []
@@ -290,7 +214,9 @@ def run_filtered_flow():
     page = 2
     while len(results) < max(want, 25) and data.get("next"):
         try:
-            data = fetch_json(build_query(topic, author, year_from, year_to, languages, sort, page=page))
+            data = gutenberg_http.fetch_json(
+                _API_OPENER, build_query(topic, author, year_from, year_to, languages, sort, page=page)
+            )
         except Exception:
             break
         results.extend(data.get("results", []))
@@ -322,17 +248,18 @@ def download_selection(books):
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     for book in books:
-        mime_prefix, format_key, url = pick_format(book.get("formats", {}))
-        if not url or not is_allowed_download_url(url):
+        mime_prefix, format_key, url = gutenberg_http.pick_format(book.get("formats", {}))
+        if not url or not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
             print(f"  #{book['id']}: подходящего формата (epub/pdf/html) на gutenberg.org не нашлось, пропускаю")
             continue
-        dest = INPUT_DIR / f"gutenberg_{book['id']}_{book.get('title', 'book')[:60]}{EXTENSION_BY_MIME_PREFIX[mime_prefix]}"
+        ext = gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]
+        dest = INPUT_DIR / f"gutenberg_{book['id']}_{book.get('title', 'book')[:60]}{ext}"
         dest = INPUT_DIR / "".join(c if c.isalnum() or c in " ._-" else "_" for c in dest.name)
         if dest.exists():
             print(f"  #{book['id']}: уже есть в input/ ({dest.name}), пропускаю")
             continue
         try:
-            download(url, dest)
+            gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest)
             print(f"  #{book['id']}: скачано -> input/{dest.name}")
         except Exception as exc:
             print(f"  #{book['id']}: скачать не удалось ({exc})")
