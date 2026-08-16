@@ -1,0 +1,83 @@
+name: Fetch Random Public-Domain Document
+
+# Manually triggered by the /maintain routine (see .claude/commands/maintain.md)
+# from a cloud coding session whose egress policy blocks most of the internet
+# but does allow GitHub itself. This workflow runs on a normal GitHub-hosted
+# runner with full internet access, does the actual fetching, and publishes
+# the result to a run-specific inbox branch (random-doc-inbox/<run id>, one
+# commit, deleted once the calling session has fetched it) so a concurrent
+# invocation can never overwrite the branch another caller is about to read.
+on:
+  workflow_dispatch:
+    inputs:
+      max_attempts:
+        description: "Max random Gutenberg IDs to try before giving up"
+        required: false
+        default: "20"
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Only this job needs to push the result branch; no other permission is used.
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+
+      - name: Fetch a random public-domain document
+        env:
+          MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts }}
+        run: python3 tools/fetch_random_doc.py --max-attempts "${MAX_ATTEMPTS:-20}"
+
+      - name: Publish to a run-specific inbox branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          INBOX_BRANCH: random-doc-inbox/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/inbox
+          mkdir -p /tmp/inbox
+          cp -r random_doc /tmp/inbox/random_doc
+          cd /tmp/inbox
+          git init -q
+          git checkout -q -b "$INBOX_BRANCH"
+          git add random_doc
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Random document drop ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          # No --force needed: the run id makes this branch name unique per run.
+          git push origin "HEAD:refs/heads/$INBOX_BRANCH"
+
+      - name: Prune stale inbox branches
+        # Best-effort hygiene, not correctness-critical: a run-specific branch
+        # name already prevents a stale branch from being mistaken for a
+        # fresh one, this step just keeps old ones from accumulating forever.
+        # Runs even if the publish step above failed (nothing to prune then,
+        # but also nothing left dangling from this run).
+        if: always()
+        env:
+          INBOX_BRANCH: random-doc-inbox/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ ! -d /tmp/inbox/.git ]; then
+            echo "publish step didn't run this time, nothing to prune"
+            exit 0
+          fi
+          cd /tmp/inbox
+          git ls-remote --heads origin 'random-doc-inbox/*' \
+            | awk '{print $2}' | sed 's#refs/heads/##' \
+            | grep -v -x -F "$INBOX_BRANCH" \
+            | while IFS= read -r branch; do
+                echo "deleting stale inbox branch: $branch"
+                git push origin --delete "$branch" || true
+              done || true
