@@ -38,12 +38,24 @@ GitHub (`github.com`, `raw.githubusercontent.com` — подтверждено) 
 + `tools/fetch_random_doc.py` решают именно эту задачу: раннер берёт случайную книгу с Project
 Gutenberg через API Gutendex, оставляет только те, где `copyright: false` (общественное
 достояние в США), качает epub/pdf/html и публикует файл + `metadata.json` (с точной ссылкой на
-основание легальности) в disposable-ветку `random-doc-inbox` (один коммит, force-push при
-каждом прогоне — историю специально не копим). Session вызывает этот workflow через
-`mcp__github__actions_run_trigger` (`method: run_workflow`, `workflow_id:
-fetch-random-document.yml`), ждёт завершения (`actions_list`/`actions_get`), затем
-`git fetch origin random-doc-inbox` и читает файл из `random_doc/` — это и есть источник
-документа для шагов 2+, без необходимости в WebFetch/WebSearch.
+основание легальности) в **run-specific** ветку `random-doc-inbox/<run_id>` (один коммит;
+именно из-за run_id в имени ветки, а не общей `random-doc-inbox`, два пересекающихся по
+времени вызова этого workflow не могут перезаписать результат друг друга — раньше была
+именно эта проблема). Старые inbox-ветки раннер сам подчищает после публикации своей.
+
+Вызов из session:
+1. `mcp__github__actions_run_trigger` (`method: run_workflow`, `workflow_id:
+   fetch-random-document.yml`, `ref: main`).
+2. Почти сразу после — `mcp__github__actions_list` (`method: list_workflow_runs`,
+   `workflow_runs_filter: {event: "workflow_dispatch"}`) и взять самый свежий run
+   (по `created_at`) для этого workflow — это и есть run_id нашего вызова.
+3. Дождаться завершения (`mcp__github__actions_get`, `method: get_workflow_run`,
+   `resource_id: <run_id>`, пока `status` не станет `completed`).
+4. `git fetch origin random-doc-inbox/<run_id>` и прочитать файл + `metadata.json` из
+   `random_doc/` на этой ветке — это и есть источник документа для шагов 2+, без
+   необходимости в WebFetch/WebSearch. Можно (но не обязательно) удалить эту ветку из
+   session'а после того, как файл скачан локально — раннер и сам подчистит её на
+   следующем прогоне.
 
 Важный технический нюанс GitHub API: `workflow_dispatch` можно вызвать только для workflow,
 уже присутствующего в **default-ветке** репозитория (`main`) — даже если запускать его

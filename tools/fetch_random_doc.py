@@ -113,11 +113,21 @@ def fetch_json(url, timeout=15):
 
 
 def download(url, dest, timeout=60):
+    """Write to a temp file and rename into place only once the full body
+    is on disk, so a failed attempt (network error, disk full mid-write)
+    never leaves a partial/empty file at dest for a later successful
+    attempt's `git add random_doc` to pick up and publish by accident.
+    """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with _OPENER.open(req, timeout=timeout) as resp:
         data = _read_capped(resp, MAX_RESPONSE_BYTES)
-    with open(dest, "wb") as f:
-        f.write(data)
+    temp_dest = dest.with_name(f".{dest.name}.part")
+    try:
+        with open(temp_dest, "wb") as f:
+            f.write(data)
+        temp_dest.replace(dest)
+    finally:
+        temp_dest.unlink(missing_ok=True)
 
 
 def resolve_out_dir(raw_out_dir):
@@ -168,7 +178,15 @@ def write_metadata(out_dir, book_id, attempt, data, format_key, url, dest):
 def try_fetch_book(book_id, attempt, out_dir):
     """Try one candidate Gutenberg id. Returns True and writes the book +
     metadata.json into out_dir on success, False if this id should be
-    skipped in favor of another random attempt."""
+    skipped in favor of another random attempt.
+
+    The `except Exception` below is deliberate, not a lint miss: this
+    function tries up to --max-attempts random ids and must survive any
+    single candidate misbehaving (network hiccup, malformed JSON, an
+    unexpected field shape) without aborting the whole run - narrowing it
+    to specific exception types would make one weird response fatal
+    instead of just skipped.
+    """
     try:
         data = fetch_json(GUTENDEX_BOOK_URL.format(book_id=book_id))
     except urllib.error.HTTPError as exc:
