@@ -1,0 +1,51 @@
+name: Fetch Random Public-Domain Document
+
+# Manually triggered by the /maintain routine (see .claude/commands/maintain.md)
+# from a cloud coding session whose egress policy blocks most of the internet
+# but does allow GitHub itself. This workflow runs on a normal GitHub-hosted
+# runner with full internet access, does the actual fetching, and publishes
+# the result to the disposable `random-doc-inbox` branch (single commit,
+# force-pushed each run) for the calling session to pull.
+on:
+  workflow_dispatch:
+    inputs:
+      max_attempts:
+        description: "Max random Gutenberg IDs to try before giving up"
+        required: false
+        default: "20"
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Fetch a random public-domain document
+        run: python3 tools/fetch_random_doc.py --max-attempts "${{ github.event.inputs.max_attempts || '20' }}"
+
+      - name: Publish to random-doc-inbox branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/inbox
+          mkdir -p /tmp/inbox
+          cp -r random_doc /tmp/inbox/random_doc
+          cd /tmp/inbox
+          git init -q
+          git checkout -q -b random-doc-inbox
+          git add random_doc
+          git -c user.name="github-actions[bot]" \
+              -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+              commit -q -m "Random document drop ($(date -u +%Y-%m-%dT%H:%M:%SZ))"
+          git remote add origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${{ github.repository }}.git"
+          git push --force origin HEAD:random-doc-inbox
