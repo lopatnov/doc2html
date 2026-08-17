@@ -34,6 +34,7 @@ this is a convenience tool for building your own local input/ collection.
 import argparse
 import secrets
 import sys
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -226,6 +227,22 @@ def ask_sort_choice():
     ).unsafe_ask()
 
 
+def fetch_search_page(url, max_attempts=3):
+    """fetch_json with a couple of retries on transient failures (timeouts,
+    connection resets) - a live run against Gutendex hit exactly this: one
+    read timeout on the very first request killed the whole search even
+    though a retry a moment later would very likely have gone through."""
+    last_exc = None
+    for attempt in range(max_attempts):
+        if attempt > 0:
+            time.sleep(1.5 * attempt)
+        try:
+            return gutenberg_http.fetch_json(_API_OPENER, url)
+        except Exception as exc:  # network hiccups vary in type; any of them is worth a retry
+            last_exc = exc
+    raise last_exc
+
+
 def collect_search_results(topic, author, year_from, year_to, languages, sort, want):
     """Fetch pages from Gutendex until there are at least `want` (or 25,
     whichever is more) results to show, or the API runs out of pages."""
@@ -234,8 +251,8 @@ def collect_search_results(topic, author, year_from, year_to, languages, sort, w
     page = 1
     while len(results) < max(want, 25):
         try:
-            data = gutenberg_http.fetch_json(
-                _API_OPENER, build_query(topic, author, year_from, year_to, languages, sort, page=page)
+            data = fetch_search_page(
+                build_query(topic, author, year_from, year_to, languages, sort, page=page)
             )
         except Exception as exc:
             if page == 1:
