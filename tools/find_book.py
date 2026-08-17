@@ -73,6 +73,9 @@ COMMON_LANGUAGES = [
     ("zh", "китайский"),
 ]
 
+# (value passed to Gutendex, label shown to the user) - value must be what's
+# passed as questionary.Choice(value=...), never the label, or select()'s
+# default matching raises ValueError (hit this for real on a live run).
 SORT_CHOICES = [
     ("popular", "по популярности (число скачиваний)"),
     ("ascending", "по номеру в каталоге Gutenberg, по возрастанию"),
@@ -81,13 +84,16 @@ SORT_CHOICES = [
 
 
 # --- small input helpers on top of questionary ---
+#
+# All prompts use unsafe_ask() rather than ask(): ask() swallows Ctrl-C and
+# returns None, which these helpers would otherwise treat as "empty input"
+# or a falsy confirm/select result instead of as a cancellation - unsafe_ask()
+# raises KeyboardInterrupt instead, which main() actually catches.
 
 
 def ask_int(message, default):
     while True:
-        raw = questionary.text(f"{message} [{default}]:").ask()
-        if raw is None:
-            raise KeyboardInterrupt
+        raw = questionary.text(f"{message} [{default}]:").unsafe_ask()
         raw = raw.strip()
         if not raw:
             return default
@@ -97,12 +103,24 @@ def ask_int(message, default):
             print("Введите целое число или просто нажмите Enter.")
 
 
+def ask_positive_int(message, default):
+    while True:
+        value = ask_int(message, default)
+        if value >= 1:
+            return value
+        print("Число должно быть больше нуля.")
+
+
 def ask_optional_int(message):
-    raw = questionary.text(f"{message} (Enter - пропустить):").ask()
-    if raw is None:
-        raise KeyboardInterrupt
-    raw = raw.strip()
-    return int(raw) if raw else None
+    while True:
+        raw = questionary.text(f"{message} (Enter - пропустить):").unsafe_ask()
+        raw = raw.strip()
+        if not raw:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            print("Введите целое число или просто нажмите Enter.")
 
 
 # --- Gutendex query building ---
@@ -140,14 +158,28 @@ def gutenberg_page_url(book_id):
     return f"https://www.gutenberg.org/ebooks/{book_id}"
 
 
+def sanitized_filename(book, ext):
+    """Build a safe input/ filename for a book. Sanitizes the title *before*
+    combining it with the gutenberg_{id}_ prefix - doing it the other way
+    around (build the path first, sanitize dest.name after) lets a title
+    containing "/" split into path segments, so dest.name would come back
+    as just the last segment and silently drop the id prefix, letting two
+    different books collide on the same filename.
+    """
+    title = book.get("title") or "book"
+    safe_title = "".join(c if c.isalnum() or c in " ._-" else "_" for c in title)[:60]
+    return f"gutenberg_{book['id']}_{safe_title}{ext}"
+
+
 # --- wizard steps ---
 
 
 def run_random_flow():
-    count = ask_int("Сколько случайных книг скачать?", default=1)
+    count = ask_positive_int("Сколько случайных книг скачать?", default=1)
     picked = []
     tried = set()
     attempts = 0
+    last_error = None
     while len(picked) < count and attempts < count * 25:
         attempts += 1
         book_id = secrets.randbelow(MAX_GUTENBERG_ID) + 1
@@ -156,42 +188,47 @@ def run_random_flow():
         tried.add(book_id)
         try:
             book = gutenberg_http.fetch_json(_API_OPENER, f"{GUTENDEX_BOOKS_URL}/{book_id}")
-        except Exception:
+        except Exception as exc:  # a single bad id shouldn't stop the whole search
+            last_error = exc
             continue
         if book.get("copyright") is not False:
             continue
         picked.append(book)
+    if not picked and last_error is not None:
+        print(f"Запросы к Gutendex не проходят: {last_error}", file=sys.stderr)
     return picked
 
 
 def run_filtered_flow():
-    topic = questionary.text("Тематика книг (Enter - пропустить):").ask()
+    topic = questionary.text("Тематика книг (Enter - пропустить):").unsafe_ask()
     print("Годы жизни автора (Gutendex не хранит год издания самой книги, только годы жизни автора):")
     year_from = ask_optional_int("  с какого года")
     year_to = ask_optional_int("  по какой год")
 
     author = None
-    if questionary.confirm("Важен автор?", default=False).ask():
-        author = questionary.text("Имя/фамилия автора (часть имени):").ask()
+    if questionary.confirm("Важен автор?", default=False).unsafe_ask():
+        author = questionary.text("Имя/фамилия автора (часть имени):").unsafe_ask()
 
     languages = None
-    if questionary.confirm("Важны языки?", default=False).ask():
+    if questionary.confirm("Важны языки?", default=False).unsafe_ask():
         chosen = questionary.checkbox(
             "Какие языки? (Пробел - отметить, Enter - продолжить)",
             choices=[questionary.Choice(title=f"{name} ({code})", value=code) for code, name in COMMON_LANGUAGES],
-        ).ask()
+        ).unsafe_ask()
         if chosen:
             languages = chosen
         else:
-            extra = questionary.text("Ни один не подошёл? Введите коды через запятую (Enter - пропустить):").ask()
+            extra = questionary.text(
+                "Ни один не подошёл? Введите коды через запятую (Enter - пропустить):"
+            ).unsafe_ask()
             if extra and extra.strip():
                 languages = [c.strip() for c in extra.split(",") if c.strip()]
 
     sort = questionary.select(
         "Сортируем по...",
         choices=[questionary.Choice(title=label, value=value) for value, label in SORT_CHOICES],
-        default=SORT_CHOICES[0][1],
-    ).ask()
+        default=SORT_CHOICES[0][0],
+    ).unsafe_ask()
 
     url = build_query(topic, author, year_from, year_to, languages, sort)
     try:
@@ -205,10 +242,9 @@ def run_filtered_flow():
         print("По этим условиям ничего не нашлось - попробуйте ослабить фильтры.")
         return []
 
-    want = ask_int(f"Сколько книг скачать из {total} найденных?", default=1)
-    if want > 20:
-        if not questionary.confirm(f"Точно скачать {want} книг?", default=False).ask():
-            want = ask_int("Сколько тогда?", default=1)
+    want = ask_positive_int(f"Сколько книг скачать из {total} найденных?", default=1)
+    if want > 20 and not questionary.confirm(f"Точно скачать {want} книг?", default=False).unsafe_ask():
+        want = ask_positive_int("Сколько тогда?", default=1)
 
     results = list(data.get("results", []))
     page = 2
@@ -229,7 +265,7 @@ def run_filtered_flow():
         choices=[
             questionary.Choice(title=format_book_line(b), value=b, checked=(b in default_picks)) for b in shown
         ],
-    ).ask()
+    ).unsafe_ask()
     return picked or []
 
 
@@ -242,19 +278,20 @@ def download_selection(books):
         print(f"\n{format_book_line(book)}")
         print(f"  Страница книги: {gutenberg_page_url(book['id'])}")
 
-    if not questionary.confirm(f"Скачать выбранное ({len(books)}) в input/?", default=True).ask():
+    if not questionary.confirm(f"Скачать выбранное ({len(books)}) в input/?", default=True).unsafe_ask():
         print("Ок, ничего не скачиваю - ссылки выше можно открыть вручную.")
         return
 
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     for book in books:
-        mime_prefix, format_key, url = gutenberg_http.pick_format(book.get("formats", {}))
+        mime_prefix, _format_key, url = gutenberg_http.pick_format(book.get("formats", {}))
+        if url:
+            url = gutenberg_http.normalize_download_url(url, ALLOWED_DOWNLOAD_HOSTS)
         if not url or not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
             print(f"  #{book['id']}: подходящего формата (epub/pdf/html) на gutenberg.org не нашлось, пропускаю")
             continue
         ext = gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]
-        dest = INPUT_DIR / f"gutenberg_{book['id']}_{book.get('title', 'book')[:60]}{ext}"
-        dest = INPUT_DIR / "".join(c if c.isalnum() or c in " ._-" else "_" for c in dest.name)
+        dest = INPUT_DIR / sanitized_filename(book, ext)
         if dest.exists():
             print(f"  #{book['id']}: уже есть в input/ ({dest.name}), пропускаю")
             continue
@@ -271,12 +308,10 @@ def main():
 
     print("Поиск книги на Project Gutenberg (через Gutendex). Enter - принять значение по умолчанию в [скобках].\n")
     try:
-        is_random = questionary.confirm("Нужна случайная книга?", default=False).ask()
-        if is_random is None:
-            raise KeyboardInterrupt
+        is_random = questionary.confirm("Нужна случайная книга?", default=False).unsafe_ask()
         books = run_random_flow() if is_random else run_filtered_flow()
         download_selection(books)
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\nОтменено.")
         return 1
     return 0

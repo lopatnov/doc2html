@@ -9,9 +9,12 @@ a compromised/malicious API response, or a runner/disk exhausted by an
 unbounded body) rather than as a URL safe to hand straight to urlopen().
 """
 import json
+import os
+import tempfile
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 USER_AGENT = "doc2html-gutenberg-tools/1.0 (+https://github.com/lopatnov/doc2html)"
 MAX_RESPONSE_BYTES = 200 * 1024 * 1024  # generous cap for even a large scanned-page epub/pdf
@@ -41,7 +44,10 @@ def make_allowlisted_redirect_handler(allowed_hosts):
     class _AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
         def redirect_request(self, req, fp, code, msg, headers, newurl):
             parsed = urllib.parse.urlparse(newurl)
-            if parsed.scheme == "https" and parsed.hostname in allowed_hosts:
+            # Same three conditions as is_allowed_download_url - the redirect
+            # hop is exactly the untrusted path this handler exists to
+            # constrain, so it must not be weaker than the direct-URL check.
+            if parsed.scheme == "https" and parsed.hostname in allowed_hosts and parsed.port is None:
                 return super().redirect_request(req, fp, code, msg, headers, newurl)
             raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
 
@@ -60,7 +66,7 @@ def read_capped(resp, max_bytes=MAX_RESPONSE_BYTES):
     chunks = []
     total = 0
     while total <= max_bytes:
-        chunk = resp.read(1024 * 1024)
+        chunk = resp.read(min(1024 * 1024, max_bytes + 1 - total))
         if not chunk:
             break
         chunks.append(chunk)
@@ -105,7 +111,11 @@ def atomic_download(opener, url, dest, timeout=60):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with opener.open(req, timeout=timeout) as resp:
         data = read_capped(resp)
-    temp_dest = dest.with_name(f".{dest.name}.part")
+    # A fixed ".{name}.part" temp name would collide if two downloads to the
+    # same dest ever ran concurrently - mkstemp gives each call its own file.
+    fd, temp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".part", dir=str(dest.parent))
+    os.close(fd)
+    temp_dest = Path(temp_name)
     try:
         with open(temp_dest, "wb") as f:
             f.write(data)
