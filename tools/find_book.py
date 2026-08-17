@@ -349,6 +349,36 @@ def run_filtered_flow():
     return picked or []
 
 
+def resolve_download_url(book, format_choice):
+    """Pick a (mime_prefix, url) for one book under format_choice, or
+    (None, None) if no allowed URL is available in that format."""
+    preferred_prefixes = None if format_choice == "any" else [format_choice]
+    mime_prefix, _format_key, url = gutenberg_http.pick_format(book.get("formats", {}), preferred_prefixes)
+    if url:
+        url = gutenberg_http.normalize_download_url(url, ALLOWED_DOWNLOAD_HOSTS)
+    if not url or not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
+        return None, None
+    return mime_prefix, url
+
+
+def download_one_book(book, format_choice):
+    mime_prefix, url = resolve_download_url(book, format_choice)
+    if not url:
+        wanted = "epub/pdf/html" if format_choice == "any" else format_choice
+        print(f"  #{book['id']}: подходящего формата ({wanted}) на gutenberg.org не нашлось, пропускаю")
+        return
+    ext = gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]
+    dest = INPUT_DIR / sanitized_filename(book, ext)
+    if dest.exists():
+        print(f"  #{book['id']}: уже есть в input/ ({dest.name}), пропускаю")
+        return
+    try:
+        gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest)
+        print(f"  #{book['id']}: скачано -> input/{dest.name}")
+    except Exception as exc:
+        print(f"  #{book['id']}: скачать не удалось ({exc})")
+
+
 def download_selection(books, format_choice="any"):
     if not books:
         print("Ничего не выбрано.")
@@ -362,26 +392,9 @@ def download_selection(books, format_choice="any"):
         print("Ок, ничего не скачиваю - ссылки выше можно открыть вручную.")
         return
 
-    preferred_prefixes = None if format_choice == "any" else [format_choice]
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     for book in books:
-        mime_prefix, _format_key, url = gutenberg_http.pick_format(book.get("formats", {}), preferred_prefixes)
-        if url:
-            url = gutenberg_http.normalize_download_url(url, ALLOWED_DOWNLOAD_HOSTS)
-        if not url or not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
-            wanted = "epub/pdf/html" if format_choice == "any" else format_choice
-            print(f"  #{book['id']}: подходящего формата ({wanted}) на gutenberg.org не нашлось, пропускаю")
-            continue
-        ext = gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]
-        dest = INPUT_DIR / sanitized_filename(book, ext)
-        if dest.exists():
-            print(f"  #{book['id']}: уже есть в input/ ({dest.name}), пропускаю")
-            continue
-        try:
-            gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest)
-            print(f"  #{book['id']}: скачано -> input/{dest.name}")
-        except Exception as exc:
-            print(f"  #{book['id']}: скачать не удалось ({exc})")
+        download_one_book(book, format_choice)
 
 
 def main():
