@@ -124,8 +124,8 @@ def atomic_download(opener, url, dest, timeout=60):
         temp_dest.unlink(missing_ok=True)
 
 
-def pick_format(formats):
-    for mime_prefix in PREFERRED_MIME_PREFIXES:
+def pick_format(formats, preferred_prefixes=None):
+    for mime_prefix in preferred_prefixes if preferred_prefixes is not None else PREFERRED_MIME_PREFIXES:
         for key, url in formats.items():
             if key.startswith(mime_prefix):
                 return mime_prefix, key, url

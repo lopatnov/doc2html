@@ -15,20 +15,25 @@ Walks through a small wizard (arrow keys where there's a choice to make,
 Enter to accept the default shown in brackets):
 
   1. Random book instead of a filtered search? (default: no)
-  2. Topic/subject (Gutendex "bookshelf" match, free text, blank = skip)
-  3. Author's birth/death year range (Gutendex doesn't track a book's own
+  2. Keyword (matched against title and author name - this is the one to
+     use for "does Gutenberg have a book called X", blank = skip)
+  3. Topic/subject (Gutendex "bookshelf"/subject match - a classification
+     tag like "Fiction", NOT a title search; blank = skip)
+  4. Author's birth/death year range (Gutendex doesn't track a book's own
      publication year - only the author's lifespan - so that's what this
      actually filters on; blank = skip)
-  4. Is the author important? -> name/part of name to search for
-  5. Do languages matter? -> pick from a list (arrow keys + space)
-  6. Sort by... (popularity / newest-added-to-Gutenberg-first / oldest-first -
+  5. Is the author important? -> name/part of name to search for
+  6. Do languages matter? -> pick from a list (arrow keys + space)
+  7. Sort by... (popularity / newest-added-to-Gutenberg-first / oldest-first -
      Gutendex has no real publication-date field, so "newest" here means
      highest catalog id, i.e. most recently added to the archive)
-  7. How many of the N matches do you want? (default: 1)
-  8. Pick specific books from the results (arrow keys + space, top N
+  8. How many of the N matches do you want? (default: 1)
+  9. Pick specific books from the results (arrow keys + space, top N
      pre-checked)
-  9. Download the selection? Either way, prints the Gutenberg book page
-     link for each pick so you can grab it by hand later.
+  10. Preferred file format (epub / pdf / html / any - falls back through
+      epub -> pdf -> html per book if a pick doesn't have the preferred one)
+  11. Download the selection? Either way, prints the Gutenberg book page
+      link for each pick so you can grab it by hand later.
 
 Not part of the committed regression suite and not invoked by /maintain -
 this is a convenience tool for building your own local input/ collection.
@@ -85,6 +90,15 @@ SORT_CHOICES = [
     ("ascending", "сначала старые (по номеру в каталоге Gutenberg, по возрастанию)"),
 ]
 
+# value is either "any" (fall back through the full PREFERRED_MIME_PREFIXES
+# order) or a single mime prefix key into gutenberg_http.EXTENSION_BY_MIME_PREFIX.
+FORMAT_CHOICES = [
+    ("any", "любой (epub → pdf → html по очереди)"),
+    ("application/epub+zip", "только epub"),
+    ("application/pdf", "только pdf"),
+    ("text/html", "только html (текст)"),
+]
+
 
 # --- small input helpers on top of questionary ---
 #
@@ -129,9 +143,11 @@ def ask_optional_int(message):
 # --- Gutendex query building ---
 
 
-def build_query(topic, author, year_from, year_to, languages, sort, page=1):
+def build_query(topic, author, year_from, year_to, languages, sort, page=1, keyword=None):
     params = {"page": str(page)}
     search_terms = []
+    if keyword:
+        search_terms.append(keyword)
     if author:
         search_terms.append(author)
     if search_terms:
@@ -229,6 +245,14 @@ def ask_sort_choice():
     ).unsafe_ask()
 
 
+def ask_format_choice():
+    return questionary.select(
+        "Предпочитаемый формат файла?",
+        choices=[questionary.Choice(title=label, value=value) for value, label in FORMAT_CHOICES],
+        default=FORMAT_CHOICES[0][0],
+    ).unsafe_ask()
+
+
 def fetch_search_page(url, max_attempts=3):
     """fetch_json with a couple of retries on transient failures (timeouts,
     connection resets) - a live run against Gutendex hit exactly this: one
@@ -245,7 +269,7 @@ def fetch_search_page(url, max_attempts=3):
     raise last_exc
 
 
-def collect_search_results(topic, author, year_from, year_to, languages, sort, want):
+def collect_search_results(topic, author, year_from, year_to, languages, sort, want, keyword=None):
     """Fetch pages from Gutendex until there are at least `want` (or 25,
     whichever is more) results to show, or the API runs out of pages."""
     results = []
@@ -254,7 +278,7 @@ def collect_search_results(topic, author, year_from, year_to, languages, sort, w
     while len(results) < max(want, 25):
         try:
             data = fetch_search_page(
-                build_query(topic, author, year_from, year_to, languages, sort, page=page)
+                build_query(topic, author, year_from, year_to, languages, sort, page=page, keyword=keyword)
             )
         except Exception as exc:
             if page == 1:
@@ -271,6 +295,9 @@ def collect_search_results(topic, author, year_from, year_to, languages, sort, w
 
 
 def run_filtered_flow():
+    keyword = questionary.text(
+        "Ключевое слово (ищет по названию и автору, Enter - пропустить):"
+    ).unsafe_ask()
     topic = questionary.text("Тематика книг (Enter - пропустить):").unsafe_ask()
     print("Годы жизни автора (Gutendex не хранит год издания самой книги, только годы жизни автора):")
     year_from = ask_optional_int("  с какого года")
@@ -281,7 +308,7 @@ def run_filtered_flow():
 
     # A cheap first request just to learn the total count before asking
     # "how many of N" - collect_search_results does the real pagination.
-    total, _ = collect_search_results(topic, author, year_from, year_to, languages, sort, want=1)
+    total, _ = collect_search_results(topic, author, year_from, year_to, languages, sort, want=1, keyword=keyword)
     if total == 0:
         print("По этим условиям ничего не нашлось - попробуйте ослабить фильтры.")
         return []
@@ -290,7 +317,7 @@ def run_filtered_flow():
     if want > 20 and not questionary.confirm(f"Точно скачать {want} книг?", default=False).unsafe_ask():
         want = ask_positive_int("Сколько тогда?", default=1)
 
-    _, results = collect_search_results(topic, author, year_from, year_to, languages, sort, want)
+    _, results = collect_search_results(topic, author, year_from, year_to, languages, sort, want, keyword=keyword)
     shown = results[:25]
     default_picks = shown[: min(want, len(shown))]
     picked = questionary.checkbox(
@@ -302,7 +329,7 @@ def run_filtered_flow():
     return picked or []
 
 
-def download_selection(books):
+def download_selection(books, format_choice="any"):
     if not books:
         print("Ничего не выбрано.")
         return
@@ -315,13 +342,15 @@ def download_selection(books):
         print("Ок, ничего не скачиваю - ссылки выше можно открыть вручную.")
         return
 
+    preferred_prefixes = None if format_choice == "any" else [format_choice]
     INPUT_DIR.mkdir(parents=True, exist_ok=True)
     for book in books:
-        mime_prefix, _format_key, url = gutenberg_http.pick_format(book.get("formats", {}))
+        mime_prefix, _format_key, url = gutenberg_http.pick_format(book.get("formats", {}), preferred_prefixes)
         if url:
             url = gutenberg_http.normalize_download_url(url, ALLOWED_DOWNLOAD_HOSTS)
         if not url or not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
-            print(f"  #{book['id']}: подходящего формата (epub/pdf/html) на gutenberg.org не нашлось, пропускаю")
+            wanted = "epub/pdf/html" if format_choice == "any" else format_choice
+            print(f"  #{book['id']}: подходящего формата ({wanted}) на gutenberg.org не нашлось, пропускаю")
             continue
         ext = gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]
         dest = INPUT_DIR / sanitized_filename(book, ext)
@@ -343,7 +372,8 @@ def main():
     try:
         is_random = questionary.confirm("Нужна случайная книга?", default=False).unsafe_ask()
         books = run_random_flow() if is_random else run_filtered_flow()
-        download_selection(books)
+        format_choice = ask_format_choice() if books else "any"
+        download_selection(books, format_choice)
     except (KeyboardInterrupt, EOFError):
         print("\nОтменено.")
         return 1
