@@ -36,7 +36,12 @@ jobs:
           python-version: "3.x"
 
       - name: Install lightweight dependencies
-        run: pip install pymupdf Pillow numpy "questionary>=2.0"
+        # Pinned exact versions + --only-binary :all: so pip only ever
+        # installs prebuilt wheels here - an unpinned/source-buildable
+        # install can pull in a newer, compromised release or run an
+        # arbitrary setup.py build script (both flagged by SonarCloud on
+        # the previous version of this line).
+        run: pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
 
       - name: Compile-check every Python file
         run: python -m compileall -q .
