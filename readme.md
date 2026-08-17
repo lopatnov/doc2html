@@ -160,6 +160,15 @@ python doc2html.py input\example.pdf -o output
 | `--lmstudio-url`                     | `http://localhost:1234/v1` | Адрес сервера LM Studio                                                                   |
 | `--lmstudio-model`                   | `lfm2.5-vl-450m`           | Имя vision-модели в LM Studio (используется при `--generate-alt lmstudio`)                |
 
+Для разовой ручной проверки одной конкретной страницы — отдельная
+scratch-папка через `-o` (не реальный `output/`!), одинаковое N в
+`--start-page`/`--end-page`, и флаги, которые пропускают состояние и
+генерацию описаний картинок ради скорости:
+
+```powershell
+python doc2html.py input\example.pdf -o scratch\page-check --start-page 42 --end-page 42 --restart --no-clean-state --generate-alt off
+```
+
 ### Поведение флагов сохранения картинок
 
 По умолчанию (`--save-images`, `--generate-alt off`): картинка
