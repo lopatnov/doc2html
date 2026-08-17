@@ -259,6 +259,37 @@ def _(page_data):
         f"строка 'sbyte' расползлась по не тем колонкам: {sbyte_row!r} - проверь _merge_split_columns"
 
 
+def _assert_image_namespacing(tmp_dir):
+    """Runs the actual checks and raises AssertionError on failure. Uses
+    explicit `raise` rather than `assert` so the checks still fire under
+    `python -O` (which strips assert statements) - required because the
+    caller catches AssertionError in a different function/scope, so Sonar's
+    "no assert inside its own try/except AssertionError" rule doesn't apply
+    here, but the -O hazard is the same either way."""
+    doc2html.convert_document(
+        NON_DESIGNERS, tmp_dir, save_images=True, generate_alt=False,
+        start_page=79, end_page=79, restart=True, clean_state=False,
+        out_format="html",
+    )
+    state_dir = doc2html.state_dir_for(tmp_dir, NON_DESIGNERS)
+    fragments = doc2html.read_existing_fragments(state_dir / "pages", 79)
+    page_data = fragments.get(79)
+    img_blocks = [b for b in page_data["blocks"] if b["type"] == "img"]
+    if not img_blocks:
+        raise AssertionError("ожидал хотя бы одну сохранённую картинку на странице 79")
+    book_dir = tmp_dir / "images" / NON_DESIGNERS.stem
+    if not book_dir.is_dir():
+        raise AssertionError(f"не нашёл {book_dir} - картинки должны лежать в подпапке на книгу")
+    for b in img_blocks:
+        if not b["src"].startswith(f"images/{NON_DESIGNERS.stem}/"):
+            raise AssertionError(
+                f"src={b['src']!r} не содержит подпапку книги - "
+                "проверь images_dir в convert_document/extract_image_block"
+            )
+        if not (tmp_dir / b["src"]).is_file():
+            raise AssertionError(f"файл {b['src']!r} не найден на диске")
+
+
 def check_image_namespacing():
     """Two different books converted into the SAME -o directory used to
     silently overwrite each other's pictures: extract_image_block() named
@@ -276,24 +307,7 @@ def check_image_namespacing():
         return None
     tmp_dir = Path(tempfile.mkdtemp(prefix="doc2html_imgtest_"))
     try:
-        doc2html.convert_document(
-            NON_DESIGNERS, tmp_dir, save_images=True, generate_alt=False,
-            start_page=79, end_page=79, restart=True, clean_state=False,
-            out_format="html",
-        )
-        state_dir = doc2html.state_dir_for(tmp_dir, NON_DESIGNERS)
-        fragments = doc2html.read_existing_fragments(state_dir / "pages", 79)
-        page_data = fragments.get(79)
-        img_blocks = [b for b in page_data["blocks"] if b["type"] == "img"]
-        assert img_blocks, "ожидал хотя бы одну сохранённую картинку на странице 79"
-        book_dir = tmp_dir / "images" / NON_DESIGNERS.stem
-        assert book_dir.is_dir(), f"не нашёл {book_dir} - картинки должны лежать в подпапке на книгу"
-        for b in img_blocks:
-            assert b["src"].startswith(f"images/{NON_DESIGNERS.stem}/"), (
-                f"src={b['src']!r} не содержит подпапку книги - "
-                "проверь images_dir в convert_document/extract_image_block"
-            )
-            assert (tmp_dir / b["src"]).is_file(), f"файл {b['src']!r} не найден на диске"
+        _assert_image_namespacing(tmp_dir)
         print(f"OK      {label}")
         return True
     except AssertionError as exc:
