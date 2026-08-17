@@ -199,45 +199,70 @@ def run_random_flow():
     return picked
 
 
-def run_filtered_flow():
-    topic = questionary.text("Тематика книг (Enter - пропустить):").unsafe_ask()
-    print("Годы жизни автора (Gutendex не хранит год издания самой книги, только годы жизни автора):")
-    year_from = ask_optional_int("  с какого года")
-    year_to = ask_optional_int("  по какой год")
+def ask_author_filter():
+    if not questionary.confirm("Важен автор?", default=False).unsafe_ask():
+        return None
+    return questionary.text("Имя/фамилия автора (часть имени):").unsafe_ask()
 
-    author = None
-    if questionary.confirm("Важен автор?", default=False).unsafe_ask():
-        author = questionary.text("Имя/фамилия автора (часть имени):").unsafe_ask()
 
-    languages = None
-    if questionary.confirm("Важны языки?", default=False).unsafe_ask():
-        chosen = questionary.checkbox(
-            "Какие языки? (Пробел - отметить, Enter - продолжить)",
-            choices=[questionary.Choice(title=f"{name} ({code})", value=code) for code, name in COMMON_LANGUAGES],
-        ).unsafe_ask()
-        if chosen:
-            languages = chosen
-        else:
-            extra = questionary.text(
-                "Ни один не подошёл? Введите коды через запятую (Enter - пропустить):"
-            ).unsafe_ask()
-            if extra and extra.strip():
-                languages = [c.strip() for c in extra.split(",") if c.strip()]
+def ask_language_filter():
+    if not questionary.confirm("Важны языки?", default=False).unsafe_ask():
+        return None
+    chosen = questionary.checkbox(
+        "Какие языки? (Пробел - отметить, Enter - продолжить)",
+        choices=[questionary.Choice(title=f"{name} ({code})", value=code) for code, name in COMMON_LANGUAGES],
+    ).unsafe_ask()
+    if chosen:
+        return chosen
+    extra = questionary.text("Ни один не подошёл? Введите коды через запятую (Enter - пропустить):").unsafe_ask()
+    return [c.strip() for c in extra.split(",") if c.strip()] if extra and extra.strip() else None
 
-    sort = questionary.select(
+
+def ask_sort_choice():
+    return questionary.select(
         "Сортируем по...",
         choices=[questionary.Choice(title=label, value=value) for value, label in SORT_CHOICES],
         default=SORT_CHOICES[0][0],
     ).unsafe_ask()
 
-    url = build_query(topic, author, year_from, year_to, languages, sort)
-    try:
-        data = gutenberg_http.fetch_json(_API_OPENER, url)
-    except Exception as exc:
-        print(f"Не удалось обратиться к Gutendex: {exc}", file=sys.stderr)
-        return []
 
-    total = data.get("count", 0)
+def collect_search_results(topic, author, year_from, year_to, languages, sort, want):
+    """Fetch pages from Gutendex until there are at least `want` (or 25,
+    whichever is more) results to show, or the API runs out of pages."""
+    results = []
+    count = 0
+    page = 1
+    while len(results) < max(want, 25):
+        try:
+            data = gutenberg_http.fetch_json(
+                _API_OPENER, build_query(topic, author, year_from, year_to, languages, sort, page=page)
+            )
+        except Exception as exc:
+            if page == 1:
+                print(f"Не удалось обратиться к Gutendex: {exc}", file=sys.stderr)
+            break
+        count = data.get("count", len(results))
+        if page == 1 and count == 0:
+            return 0, []
+        results.extend(data.get("results", []))
+        if not data.get("next"):
+            break
+        page += 1
+    return count, results
+
+
+def run_filtered_flow():
+    topic = questionary.text("Тематика книг (Enter - пропустить):").unsafe_ask()
+    print("Годы жизни автора (Gutendex не хранит год издания самой книги, только годы жизни автора):")
+    year_from = ask_optional_int("  с какого года")
+    year_to = ask_optional_int("  по какой год")
+    author = ask_author_filter()
+    languages = ask_language_filter()
+    sort = ask_sort_choice()
+
+    # A cheap first request just to learn the total count before asking
+    # "how many of N" - collect_search_results does the real pagination.
+    total, _ = collect_search_results(topic, author, year_from, year_to, languages, sort, want=1)
     if total == 0:
         print("По этим условиям ничего не нашлось - попробуйте ослабить фильтры.")
         return []
@@ -246,18 +271,7 @@ def run_filtered_flow():
     if want > 20 and not questionary.confirm(f"Точно скачать {want} книг?", default=False).unsafe_ask():
         want = ask_positive_int("Сколько тогда?", default=1)
 
-    results = list(data.get("results", []))
-    page = 2
-    while len(results) < max(want, 25) and data.get("next"):
-        try:
-            data = gutenberg_http.fetch_json(
-                _API_OPENER, build_query(topic, author, year_from, year_to, languages, sort, page=page)
-            )
-        except Exception:
-            break
-        results.extend(data.get("results", []))
-        page += 1
-
+    _, results = collect_search_results(topic, author, year_from, year_to, languages, sort, want)
     shown = results[:25]
     default_picks = shown[: min(want, len(shown))]
     picked = questionary.checkbox(
