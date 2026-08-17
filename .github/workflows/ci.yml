@@ -12,6 +12,12 @@ on:
     branches: [main]
   pull_request:
 
+# Top-level default: no token permissions unless a job opts in below. This
+# workflow only ever needs to read the checked-out code, never to write
+# anything back, so the job-level grant right below matches that exactly.
+permissions:
+  contents: read
+
 jobs:
   smoke-test:
     runs-on: ubuntu-latest
