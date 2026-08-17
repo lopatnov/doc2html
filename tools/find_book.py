@@ -27,7 +27,11 @@ Enter to accept the default shown in brackets):
   7. Sort by... (popularity / newest-added-to-Gutenberg-first / oldest-first -
      Gutendex has no real publication-date field, so "newest" here means
      highest catalog id, i.e. most recently added to the archive)
-  8. How many of the N matches do you want? (default: 1)
+  8. How many of the N matches do you want? (default: 1) - this also sets how
+     many results are offered for picking in the next step (Gutendex sorts
+     search matches by popularity, not relevance, so a niche book can sit far
+     past the first page even for a short, on-target keyword - raise this
+     number if you don't see the book you're after)
   9. Pick specific books from the results (arrow keys + space, top N
      pre-checked)
   10. Preferred file format (epub / pdf / html / any - falls back through
@@ -313,12 +317,28 @@ def run_filtered_flow():
         print("По этим условиям ничего не нашлось - попробуйте ослабить фильтры.")
         return []
 
-    want = ask_positive_int(f"Сколько книг скачать из {total} найденных?", default=1)
+    want = ask_positive_int(
+        f"Сколько книг скачать из {total} найденных? "
+        "(это число также определяет, сколько результатов будет предложено на выбор - "
+        "увеличьте его, если нужной книги нет в списке ниже)",
+        default=1,
+    )
     if want > 20 and not questionary.confirm(f"Точно скачать {want} книг?", default=False).unsafe_ask():
         want = ask_positive_int("Сколько тогда?", default=1)
 
     _, results = collect_search_results(topic, author, year_from, year_to, languages, sort, want, keyword=keyword)
-    shown = results[:25]
+    # Show everything collect_search_results actually fetched (already bounded
+    # by max(want, 25) there) instead of hard-truncating to 25 - Gutendex sorts
+    # search results by popularity, not relevance, so a niche book can easily
+    # sit past position 25 even for a short, on-target keyword (e.g. "Auto" for
+    # "Automobiles" by Zerbe lands around rank 115 among 314 matches because
+    # far more popular books also contain an "auto..." word somewhere).
+    shown = results
+    if total > len(shown):
+        print(
+            f"Показаны {len(shown)} из {total} найденных (Gutendex сортирует по популярности, "
+            "не по релевантности) - если нужной книги нет в списке, увеличьте число выше."
+        )
     default_picks = shown[: min(want, len(shown))]
     picked = questionary.checkbox(
         "Выберите книги (Пробел - отметить/снять, Enter - продолжить):",
