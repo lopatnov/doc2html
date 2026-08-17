@@ -153,31 +153,40 @@ def order_score(source_tokens, extracted_tokens):
 
 def structural_findings(page_data):
     findings = []
-    blocks = page_data["blocks"]
     prev_text = None
-    for i, b in enumerate(blocks):
+    for i, b in enumerate(page_data["blocks"]):
         text = b.get("text", "")
-        if b["type"] in ("p", "li") and len(text) > 1 and any(ch in text[1:] for ch in doc2html.LIST_BULLET_CHARS):
-            findings.append(f"блок #{i} ({b['type']}): маркер списка внутри текста - похоже на слипшийся пункт списка")
-        if b["type"] == "code" and "\n" not in text:
-            findings.append(f"блок #{i} (code): нет переноса строк - код мог склеиться в одну строку")
-        if b["type"] == "table":
-            widths = {len(r) for r in b.get("rows", [])}
-            if len(widths) > 1:
-                findings.append(f"блок #{i} (table): неровные строки (число колонок: {sorted(widths)})")
-        if text and text.rstrip().endswith("-") and b["type"] in ("p", "li", "h"):
-            findings.append(f"блок #{i} ({b['type']}): обрывается на дефисе - возможен разрыв слова")
-        if prev_text is not None and text and text == prev_text:
-            findings.append(f"блок #{i} ({b['type']}): дублирует предыдущий блок дословно")
+        findings.extend(_block_structural_findings(i, b, text, prev_text))
         prev_text = text
-    margin = page_data.get("margin", [])
+    findings.extend(_margin_structural_findings(page_data.get("margin", [])))
+    return findings
+
+
+def _block_structural_findings(i, b, text, prev_text):
+    findings = []
+    if b["type"] in ("p", "li") and len(text) > 1 and any(ch in text[1:] for ch in doc2html.LIST_BULLET_CHARS):
+        findings.append(f"блок #{i} ({b['type']}): маркер списка внутри текста - похоже на слипшийся пункт списка")
+    if b["type"] == "code" and "\n" not in text:
+        findings.append(f"блок #{i} (code): нет переноса строк - код мог склеиться в одну строку")
+    if b["type"] == "table":
+        widths = {len(r) for r in b.get("rows", [])}
+        if len(widths) > 1:
+            findings.append(f"блок #{i} (table): неровные строки (число колонок: {sorted(widths)})")
+    if text and text.rstrip().endswith("-") and b["type"] in ("p", "li", "h"):
+        findings.append(f"блок #{i} ({b['type']}): обрывается на дефисе - возможен разрыв слова")
+    if prev_text is not None and text and text == prev_text:
+        findings.append(f"блок #{i} ({b['type']}): дублирует предыдущий блок дословно")
+    return findings
+
+
+def _margin_structural_findings(margin):
     margin_words = sum(len(tokenize(m)) for m in margin)
     if margin_words > MARGIN_SUSPICIOUS_WORD_COUNT:
-        findings.append(
+        return [
             f"margin подозрительно длинный ({margin_words} слов) - похоже на текст, "
             "утёкший в колонтитул (класс бага 'сноска в margin')"
-        )
-    return findings
+        ]
+    return []
 
 
 def audit_page(doc, page_number, page_data, use_gpu):
@@ -270,7 +279,8 @@ def main():
 
     results.sort(key=lambda r: -r["score"])
 
-    report_path = Path(args.report) if args.report else output_dir / "audit_findings.json"
+    report_path = Path(args.report).resolve() if args.report else output_dir / "audit_findings.json"
+    report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     flagged = [r for r in results if r["score"] > 0]

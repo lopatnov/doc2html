@@ -1,0 +1,58 @@
+name: CI
+
+# Smoke-tests every push/PR: syntax-compiles the whole repo, import-checks
+# the tools/*.py scripts, and runs the regression harness. torch/easyocr
+# (OCR path) are deliberately NOT installed here - doc2html.py only imports
+# them lazily inside the functions that need them, and tests/regression_check.py
+# skips cleanly when input/ (gitignored, real books) isn't present, so a
+# lightweight dependency set is enough to catch import errors, syntax
+# errors, and any check that doesn't require a local book fixture.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Top-level default: no token permissions unless a job opts in below. This
+# workflow only ever needs to read the checked-out code, never to write
+# anything back, so the job-level grant right below matches that exactly.
+permissions:
+  contents: read
+
+jobs:
+  smoke-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.x"
+
+      - name: Install lightweight dependencies
+        # Pinned exact versions + --only-binary :all: so pip only ever
+        # installs prebuilt wheels here - an unpinned/source-buildable
+        # install can pull in a newer, compromised release or run an
+        # arbitrary setup.py build script (both flagged by SonarCloud on
+        # the previous version of this line).
+        run: pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
+
+      - name: Compile-check every Python file
+        run: python -m compileall -q .
+
+      - name: Import-check the tools/ scripts
+        run: |
+          cd tools
+          python -c "import find_book, fetch_random_doc, gutenberg_http, audit_pages"
+
+      - name: Run regression harness
+        # Real book fixtures live in input/ (gitignored) - checks against a
+        # missing book skip cleanly instead of failing, so this still
+        # validates the harness itself and any book-independent checks.
+        run: python tests/regression_check.py

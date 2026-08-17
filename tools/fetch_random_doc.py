@@ -22,13 +22,12 @@ import json
 import secrets
 import sys
 import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
+
+import gutenberg_http
 
 GUTENDEX_BOOK_URL = "https://gutendex.com/books/{book_id}"
 MAX_GUTENBERG_ID = 75000
-USER_AGENT = "doc2html-random-doc-fetcher/1.0 (+https://github.com/lopatnov/doc2html)"
 
 # Gutendex's "formats" field hands back a download URL taken from its own
 # catalog data, not something we should treat as trusted - restrict where we
@@ -36,109 +35,9 @@ USER_AGENT = "doc2html-random-doc-fetcher/1.0 (+https://github.com/lopatnov/doc2
 # blocklist) so a compromised/malicious API response can't redirect us into
 # fetching an arbitrary URL (SSRF).
 ALLOWED_DOWNLOAD_HOSTS = {"www.gutenberg.org", "gutenberg.org"}
-MAX_RESPONSE_BYTES = 200 * 1024 * 1024  # generous cap for even a large scanned-page epub/pdf
 
-
-def is_allowed_download_url(url):
-    parsed = urllib.parse.urlparse(url)
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS
-        and parsed.port is None  # reject an explicit non-default port, e.g. gutenberg.org:8081
-    )
-
-
-def normalize_download_url(url):
-    """Upgrade http -> https for a recognized Gutenberg host (Gutendex
-    sometimes hands back http:// links). Never downgrades; anything else
-    is returned unchanged and left for is_allowed_download_url to reject.
-    """
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme == "http" and parsed.hostname in ALLOWED_DOWNLOAD_HOSTS:
-        parsed = parsed._replace(scheme="https")
-        return urllib.parse.urlunparse(parsed)
-    return url
-
-
-def _make_allowlisted_redirect_handler(allowed_hosts):
-    """A urllib redirect handler that re-validates *every* hop against
-    allowed_hosts (https + exact hostname) instead of trusting urlopen()'s
-    default behavior of blindly following redirects. First version of this
-    refused all redirects outright, which turned out to break the normal
-    case too: Gutendex's REST API (Django-style) 301-redirects
-    /books/{id} -> /books/{id}/ on every request, same host - confirmed by
-    running the real workflow, where all 20 attempts failed with
-    "HTTP 301" before this fix existed. Allowlisting the host (rather than
-    just accepting "same as request") still blocks a same-host response
-    from redirecting off-host to an attacker-controlled server (SSRF).
-    """
-
-    class _AllowlistedRedirectHandler(urllib.request.HTTPRedirectHandler):
-        def redirect_request(self, req, fp, code, msg, headers, newurl):
-            parsed = urllib.parse.urlparse(newurl)
-            if parsed.scheme == "https" and parsed.hostname in allowed_hosts:
-                return super().redirect_request(req, fp, code, msg, headers, newurl)
-            raise urllib.error.HTTPError(newurl, code, f"refusing to follow redirect to {newurl!r}", headers, fp)
-
-    return _AllowlistedRedirectHandler
-
-
-_API_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler({"gutendex.com"}))
-_DOWNLOAD_OPENER = urllib.request.build_opener(_make_allowlisted_redirect_handler(ALLOWED_DOWNLOAD_HOSTS))
-
-# Ordered by how well doc2html.py (via PyMuPDF) handles them for QA purposes.
-PREFERRED_MIME_PREFIXES = [
-    "application/epub+zip",
-    "application/pdf",
-    "text/html",
-]
-EXTENSION_BY_MIME_PREFIX = {
-    "application/epub+zip": ".epub",
-    "application/pdf": ".pdf",
-    "text/html": ".html",
-}
-
-
-def _read_capped(resp, max_bytes):
-    """Read at most max_bytes+1 from resp - the +1 lets the caller tell
-    "exactly at the cap" apart from "went over" without reading unbounded
-    data first. Guards against a malicious/broken response streaming an
-    unbounded body at us (runner disk/memory exhaustion)."""
-    chunks = []
-    total = 0
-    while total <= max_bytes:
-        chunk = resp.read(1024 * 1024)
-        if not chunk:
-            break
-        chunks.append(chunk)
-        total += len(chunk)
-    if total > max_bytes:
-        raise ValueError(f"response exceeded {max_bytes} byte cap")
-    return b"".join(chunks)
-
-
-def fetch_json(url, timeout=15):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _API_OPENER.open(req, timeout=timeout) as resp:
-        return json.loads(_read_capped(resp, MAX_RESPONSE_BYTES))
-
-
-def download(url, dest, timeout=60):
-    """Write to a temp file and rename into place only once the full body
-    is on disk, so a failed attempt (network error, disk full mid-write)
-    never leaves a partial/empty file at dest for a later successful
-    attempt's `git add random_doc` to pick up and publish by accident.
-    """
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with _DOWNLOAD_OPENER.open(req, timeout=timeout) as resp:
-        data = _read_capped(resp, MAX_RESPONSE_BYTES)
-    temp_dest = dest.with_name(f".{dest.name}.part")
-    try:
-        with open(temp_dest, "wb") as f:
-            f.write(data)
-        temp_dest.replace(dest)
-    finally:
-        temp_dest.unlink(missing_ok=True)
+_API_OPENER = gutenberg_http.build_opener({"gutendex.com"})
+_DOWNLOAD_OPENER = gutenberg_http.build_opener(ALLOWED_DOWNLOAD_HOSTS)
 
 
 def resolve_out_dir(raw_out_dir):
@@ -154,14 +53,6 @@ def resolve_out_dir(raw_out_dir):
     except ValueError:
         raise SystemExit(f"--out-dir must resolve to a path inside {base} (got {resolved})")
     return resolved
-
-
-def pick_format(formats):
-    for mime_prefix in PREFERRED_MIME_PREFIXES:
-        for key, url in formats.items():
-            if key.startswith(mime_prefix):
-                return mime_prefix, key, url
-    return None, None, None
 
 
 def write_metadata(out_dir, book_id, attempt, data, format_key, url, dest):
@@ -199,7 +90,7 @@ def try_fetch_book(book_id, attempt, out_dir):
     instead of just skipped.
     """
     try:
-        data = fetch_json(GUTENDEX_BOOK_URL.format(book_id=book_id))
+        data = gutenberg_http.fetch_json(_API_OPENER, GUTENDEX_BOOK_URL.format(book_id=book_id))
     except urllib.error.HTTPError as exc:
         if exc.code != 404:
             print(f"attempt {attempt}: HTTP {exc.code} for id {book_id}", file=sys.stderr)
@@ -213,17 +104,17 @@ def try_fetch_book(book_id, attempt, out_dir):
         # None (unknown) or True (copyrighted) are both too risky to use.
         return False
 
-    mime_prefix, format_key, url = pick_format(data.get("formats", {}))
+    mime_prefix, format_key, url = gutenberg_http.pick_format(data.get("formats", {}))
     if not url:
         return False
-    url = normalize_download_url(url)
-    if not is_allowed_download_url(url):
+    url = gutenberg_http.normalize_download_url(url, ALLOWED_DOWNLOAD_HOSTS)
+    if not gutenberg_http.is_allowed_download_url(url, ALLOWED_DOWNLOAD_HOSTS):
         print(f"attempt {attempt}: refusing non-Gutenberg download URL {url!r} for id {book_id}", file=sys.stderr)
         return False
 
-    dest = out_dir / f"gutenberg_{book_id}{EXTENSION_BY_MIME_PREFIX[mime_prefix]}"
+    dest = out_dir / f"gutenberg_{book_id}{gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]}"
     try:
-        download(url, dest)
+        gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest)
     except Exception as exc:
         print(f"attempt {attempt}: download failed for id {book_id}: {exc}", file=sys.stderr)
         return False

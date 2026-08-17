@@ -24,7 +24,6 @@ import re
 import shutil
 import sys
 import unicodedata
-import urllib.error
 import urllib.request
 import zipfile
 from html import escape
@@ -295,7 +294,7 @@ def caption_image_lmstudio(image_bytes, base_url, model_name):
             result = json.loads(response.read().decode("utf-8"))
         caption = result["choices"][0]["message"]["content"].strip()
         return caption or None
-    except (urllib.error.URLError, OSError, KeyError, IndexError, ValueError) as exc:
+    except (OSError, KeyError, IndexError, ValueError) as exc:
         print(f"Не удалось получить описание от LM Studio: {exc}", file=sys.stderr)
         return None
 
@@ -311,7 +310,7 @@ def check_lmstudio(base_url, model_name):
     try:
         with urllib.request.urlopen(f"{base_url.rstrip('/')}/models", timeout=5) as response:
             data = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, OSError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         return False, (
             f"Не удалось подключиться к LM Studio по адресу {base_url} ({exc}). "
             "Убедитесь, что в LM Studio включён Local Server и загружена "
@@ -351,6 +350,31 @@ def vertical_overlap_ratio(a_y0, a_y1, b_y0, b_y1):
     return overlap / union if union > 0 else 0.0
 
 
+def _find_row_split_at(boxes, gaps, gutter):
+    """Picks the box index to split a merged row at, or None if it should
+    stay merged. Tries the geometric gutter first (a genuine but narrow
+    column gap, e.g. ~11pt in print, that the size/ratio heuristic below
+    would otherwise leave fused); falls back to the widest internal gap
+    when it's both large in absolute terms and clearly wider than the
+    row's other gaps."""
+    if gutter is not None:
+        gutter_left, gutter_right = gutter
+        for i, gap in enumerate(gaps):
+            if gap > 0 and boxes[i]["x1"] <= gutter_right and boxes[i + 1]["x0"] >= gutter_left:
+                return i + 1
+
+    max_gap = max(gaps)
+    candidate = gaps.index(max_gap) + 1
+    if max_gap < COLUMN_SPLIT_MIN_GAP:
+        return None
+    other_gaps = gaps[:candidate - 1] + gaps[candidate:]
+    if other_gaps:
+        median_other = sorted(other_gaps)[len(other_gaps) // 2]
+        if median_other > 0 and max_gap < median_other * COLUMN_SPLIT_GAP_RATIO:
+            return None
+    return candidate
+
+
 def split_merged_row(row, gutter=None):
     """A row built by vertical-overlap merging can accidentally fuse two
     DIFFERENT columns' entries that happen to share a baseline (e.g. a page
@@ -378,26 +402,9 @@ def split_merged_row(row, gutter=None):
         return [row]
 
     gaps = [boxes[i]["x0"] - boxes[i - 1]["x1"] for i in range(1, len(boxes))]
-
-    split_at = None
-    if gutter is not None:
-        gutter_left, gutter_right = gutter
-        for i, gap in enumerate(gaps):
-            if gap > 0 and boxes[i]["x1"] <= gutter_right and boxes[i + 1]["x0"] >= gutter_left:
-                split_at = i + 1
-                break
-
+    split_at = _find_row_split_at(boxes, gaps, gutter)
     if split_at is None:
-        max_gap = max(gaps)
-        candidate = gaps.index(max_gap) + 1
-        if max_gap < COLUMN_SPLIT_MIN_GAP:
-            return [row]
-        other_gaps = gaps[:candidate - 1] + gaps[candidate:]
-        if other_gaps:
-            median_other = sorted(other_gaps)[len(other_gaps) // 2]
-            if median_other > 0 and max_gap < median_other * COLUMN_SPLIT_GAP_RATIO:
-                return [row]
-        split_at = candidate
+        return [row]
 
     right_boxes = boxes[split_at:]
     if is_page_number_like(" ".join(b["text"] for b in right_boxes).strip()):
@@ -501,7 +508,17 @@ def find_callout_boxes(page, page_dict):
     if not rects:
         return []
 
-    tolerance = 3
+    image_rects = [pymupdf.Rect(b["bbox"]) for b in page_dict["blocks"] if b["type"] == 1]
+    return [
+        rect for rect in _merge_touching_rects(rects, tolerance=3)
+        if _is_plausible_callout_box(rect, page_width, image_rects)
+    ]
+
+
+def _merge_touching_rects(rects, tolerance):
+    """Union-find merge of rects that touch or nearly touch (within
+    `tolerance` points) into their bounding boxes - a callout box's border
+    is typically drawn as several separate thin line/fill segments."""
     n = len(rects)
     parent = list(range(n))
 
@@ -530,29 +547,27 @@ def find_callout_boxes(page, page_dict):
             groups[root] |= rects[i]
         else:
             groups[root] = pymupdf.Rect(rects[i])
+    return list(groups.values())
 
-    image_rects = [pymupdf.Rect(b["bbox"]) for b in page_dict["blocks"] if b["type"] == 1]
 
-    boxes = []
-    for rect in groups.values():
-        if rect.width >= page_width * CALLOUT_MAX_WIDTH_RATIO:
+def _is_plausible_callout_box(rect, page_width, image_rects):
+    """Filters out a full-width rect (e.g. a header underline), a tiny stray
+    mark, and anything that's mostly a frame drawn around an embedded image
+    (e.g. a screenshot border) - OCR'ing that region would just read the
+    picture's own on-screen text as if it were callout prose."""
+    if rect.width >= page_width * CALLOUT_MAX_WIDTH_RATIO:
+        return False
+    if rect.height < CALLOUT_MIN_SIZE_PT or rect.width < CALLOUT_MIN_SIZE_PT:
+        return False
+    box_area = rect.width * rect.height
+    for img_rect in image_rects:
+        intersection = rect & img_rect
+        if intersection.is_empty:
             continue
-        if rect.height < CALLOUT_MIN_SIZE_PT or rect.width < CALLOUT_MIN_SIZE_PT:
-            continue
-        box_area = rect.width * rect.height
-        is_image_frame = False
-        for img_rect in image_rects:
-            intersection = rect & img_rect
-            if intersection.is_empty:
-                continue
-            overlap_area = intersection.width * intersection.height
-            if box_area > 0 and overlap_area / box_area > CALLOUT_IMAGE_OVERLAP_MAX_RATIO:
-                is_image_frame = True
-                break
-        if is_image_frame:
-            continue
-        boxes.append(rect)
-    return boxes
+        overlap_area = intersection.width * intersection.height
+        if box_area > 0 and overlap_area / box_area > CALLOUT_IMAGE_OVERLAP_MAX_RATIO:
+            return False
+    return True
 
 
 LEADING_PAGE_NUMBER_RE = re.compile(r"^\d{1,4}\s")
@@ -740,6 +755,13 @@ def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0, gutter=None
     import numpy as np
 
     raw_results = reader.readtext(np.array(image), detail=1, paragraph=False)
+    line_boxes = _line_boxes_from_ocr_results(raw_results, offset_x, offset_y)
+    rows = cluster_rows(line_boxes, gutter=gutter)
+    column_groups = _group_rows_by_column(rows, gutter)
+    return _paragraphs_from_column_groups(column_groups)
+
+
+def _line_boxes_from_ocr_results(raw_results, offset_x, offset_y):
     line_boxes = []
     for bbox, text, _confidence in raw_results:
         text = text.strip()
@@ -752,46 +774,57 @@ def ocr_region_paragraphs(reader, image, offset_x=0.0, offset_y=0.0, gutter=None
             "y0": min(ys) + offset_y, "y1": max(ys) + offset_y,
             "text": text,
         })
+    return line_boxes
 
-    rows = cluster_rows(line_boxes, gutter=gutter)
 
+def _group_rows_by_column(rows, gutter):
+    """Splits OCR rows into (column_index, rows) groups so reading order can
+    go fully top-to-bottom per column instead of interleaved by height (see
+    ocr_region_paragraphs). column_index is None when there's no gutter (one
+    group, no HTML column tagging needed)."""
     if gutter is None:
-        column_groups = [(None, rows)]
-    else:
-        gutter_left, gutter_right = gutter
-        # The midpoint, not either raw edge: a row's x0 is where its own
-        # text starts, so a right-column row's x0 sits flush against
-        # gutter_right by construction (that edge IS the right column's own
-        # leftmost content, e.g. a lone leading page number like "102" in a
-        # table-of-contents entry) - comparing against gutter_right leaves
-        # zero margin for ordinary OCR bbox jitter and misclassifies such
-        # rows into the left column, splicing unrelated columns' text
-        # together. The midpoint gives roughly equal tolerance on both
-        # sides instead.
-        gutter_mid = (gutter_left + gutter_right) / 2
-        left = sorted((r for r in rows if r["x0"] < gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
-        right = sorted((r for r in rows if r["x0"] >= gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
-        column_groups = [(idx, group) for idx, group in enumerate((left, right)) if group]
+        return [(None, rows)]
+    gutter_left, gutter_right = gutter
+    # The midpoint, not either raw edge: a row's x0 is where its own text
+    # starts, so a right-column row's x0 sits flush against gutter_right by
+    # construction (that edge IS the right column's own leftmost content,
+    # e.g. a lone leading page number like "102" in a table-of-contents
+    # entry) - comparing against gutter_right leaves zero margin for
+    # ordinary OCR bbox jitter and misclassifies such rows into the left
+    # column, splicing unrelated columns' text together. The midpoint gives
+    # roughly equal tolerance on both sides instead.
+    gutter_mid = (gutter_left + gutter_right) / 2
+    left = sorted((r for r in rows if r["x0"] < gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
+    right = sorted((r for r in rows if r["x0"] >= gutter_mid), key=lambda r: (r["y0"] + r["y1"]) / 2)
+    return [(idx, group) for idx, group in enumerate((left, right)) if group]
 
+
+def _paragraphs_from_column_groups(column_groups):
     paragraphs = []
     for col_index, group_rows in column_groups:
         if not group_rows:
             continue
         group_min_x0 = min(r["x0"] for r in group_rows)
         for para in reflow_rows_into_paragraphs(group_rows):
-            text = clean_text(para["text"])
-            if not text.strip():
-                continue
-            entry = {"text": text, "y0": para["y0"], "y1": para["y1"]}
-            if para.get("heading_level"):
-                entry["heading_level"] = para["heading_level"]
-            if col_index is not None:
-                entry["column"] = col_index
-                indent_em = round((para["x0"] - group_min_x0) / OCR_INDENT_PX_PER_EM, 1)
-                if OCR_INDENT_MIN_EM <= indent_em <= OCR_INDENT_MAX_EM:
-                    entry["indent_em"] = indent_em
-            paragraphs.append(entry)
+            entry = _ocr_paragraph_entry(para, col_index, group_min_x0)
+            if entry is not None:
+                paragraphs.append(entry)
     return paragraphs
+
+
+def _ocr_paragraph_entry(para, col_index, group_min_x0):
+    text = clean_text(para["text"])
+    if not text.strip():
+        return None
+    entry = {"text": text, "y0": para["y0"], "y1": para["y1"]}
+    if para.get("heading_level"):
+        entry["heading_level"] = para["heading_level"]
+    if col_index is not None:
+        entry["column"] = col_index
+        indent_em = round((para["x0"] - group_min_x0) / OCR_INDENT_PX_PER_EM, 1)
+        if OCR_INDENT_MIN_EM <= indent_em <= OCR_INDENT_MAX_EM:
+            entry["indent_em"] = indent_em
+    return entry
 
 
 def ocr_page_regions(page, page_dict, use_gpu):
@@ -903,16 +936,24 @@ def collect_superscript_digit_markers(page_dict):
     other silently drops the footnote's content into page metadata (see
     extract_page_blocks)."""
     markers = set()
-    for block in page_dict["blocks"]:
-        if block["type"] != 0:
-            continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                if span.get("flags", 0) & 1:
-                    text = span.get("text", "").strip()
-                    if text.isdigit():
-                        markers.add(text)
+    for span in _iter_page_spans(page_dict):
+        if span.get("flags", 0) & 1:
+            text = span.get("text", "").strip()
+            if text.isdigit():
+                markers.add(text)
     return markers
+
+
+def _iter_block_spans(block):
+    for line in block.get("lines", []):
+        yield from line.get("spans", [])
+
+
+def _iter_page_spans(page_dict, block_type=0):
+    for block in page_dict["blocks"]:
+        if block["type"] != block_type:
+            continue
+        yield from _iter_block_spans(block)
 
 
 def _blocks_run_in_parallel(left, right):
@@ -973,20 +1014,22 @@ def detect_column_boundary_x(page_dict, page_height, callout_boxes=None):
         if b["type"] == 0 and not is_in_margin_zone(b["bbox"][1], b["bbox"][3], page_height)
     ]
     if callout_boxes:
-        def _in_callout(block):
-            block_rect = pymupdf.Rect(block["bbox"])
-            block_area = block_rect.width * block_rect.height
-            if block_area <= 0:
-                return False
-            for box in callout_boxes:
-                overlap = block_rect & box
-                if overlap.is_empty:
-                    continue
-                if (overlap.width * overlap.height) / block_area > CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
-                    return True
-            return False
-        text_blocks = [b for b in text_blocks if not _in_callout(b)]
+        text_blocks = [b for b in text_blocks if not _block_in_callout(b, callout_boxes)]
     return _find_column_gap(text_blocks)
+
+
+def _block_in_callout(block, callout_boxes):
+    block_rect = pymupdf.Rect(block["bbox"])
+    block_area = block_rect.width * block_rect.height
+    if block_area <= 0:
+        return False
+    for box in callout_boxes:
+        overlap = block_rect & box
+        if overlap.is_empty:
+            continue
+        if (overlap.width * overlap.height) / block_area > CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
+            return True
+    return False
 
 
 def _find_column_gap(text_blocks, min_blocks=4):
@@ -1313,13 +1356,12 @@ def compute_body_font_size(page_dict, page_height):
             continue
         if is_in_margin_zone(block["bbox"][1], block["bbox"][3], page_height):
             continue
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                text = span.get("text", "")
-                if not text.strip():
-                    continue
-                size = round(span.get("size", 0.0), 1)
-                sizes[size] = sizes.get(size, 0) + len(text)
+        for span in _iter_block_spans(block):
+            text = span.get("text", "")
+            if not text.strip():
+                continue
+            size = round(span.get("size", 0.0), 1)
+            sizes[size] = sizes.get(size, 0) + len(text)
     if not sizes:
         return None
     size, count = max(sizes.items(), key=lambda item: item[1])
@@ -1559,27 +1601,16 @@ def render_runs_html(runs):
 def render_block_html(block):
     block_type = block["type"]
     if block_type in ("p", "p_numeric"):
-        css_class = "ocr-numbers" if block_type == "p_numeric" else None
-        style = f' style="margin-left:{block["indent_em"]}em"' if block.get("indent_em") else ""
-        class_attr = f' class="{css_class}"' if css_class else ""
-        inner = render_runs_html(block["runs"]) if block.get("runs") else linkify_html(block["text"])
-        return f"<p{class_attr}{style}>{inner}</p>"
+        return _render_paragraph_html(block, block_type)
     if block_type == "h":
         level = block["level"]
         return f"<h{level}>{escape(block['text'])}</h{level}>"
     if block_type == "img":
         return f'<img src="{block["src"]}" alt="{escape(block["alt"])}" loading="lazy">'
     if block_type == "img_placeholder":
-        if block["caption"]:
-            return f'<p class="image-placeholder">[Изображение: {escape(block["caption"])}]</p>'
-        return '<p class="image-placeholder">[Изображение]</p>'
+        return _render_image_placeholder_html(block)
     if block_type == "table":
-        header, *body = block["rows"]
-        parts = ["<table>", "<tr>" + "".join(f"<th>{escape(c)}</th>" for c in header) + "</tr>"]
-        for row in body:
-            parts.append("<tr>" + "".join(f"<td>{escape(c)}</td>" for c in row) + "</tr>")
-        parts.append("</table>")
-        return "\n".join(parts)
+        return _render_table_html(block)
     if block_type == "code":
         return f"<pre><code>{escape(block['text'])}</code></pre>"
     if block_type == "li":
@@ -1590,6 +1621,29 @@ def render_block_html(block):
         tag = "ol" if block.get("ordered") else "ul"
         return f"<{tag}><li>{linkify_html(block['text'])}</li></{tag}>"
     raise ValueError(f"unknown block type: {block_type}")
+
+
+def _render_paragraph_html(block, block_type):
+    css_class = "ocr-numbers" if block_type == "p_numeric" else None
+    style = f' style="margin-left:{block["indent_em"]}em"' if block.get("indent_em") else ""
+    class_attr = f' class="{css_class}"' if css_class else ""
+    inner = render_runs_html(block["runs"]) if block.get("runs") else linkify_html(block["text"])
+    return f"<p{class_attr}{style}>{inner}</p>"
+
+
+def _render_image_placeholder_html(block):
+    if block["caption"]:
+        return f'<p class="image-placeholder">[Изображение: {escape(block["caption"])}]</p>'
+    return '<p class="image-placeholder">[Изображение]</p>'
+
+
+def _render_table_html(block):
+    header, *body = block["rows"]
+    parts = ["<table>", "<tr>" + "".join(f"<th>{escape(c)}</th>" for c in header) + "</tr>"]
+    for row in body:
+        parts.append("<tr>" + "".join(f"<td>{escape(c)}</td>" for c in row) + "</tr>")
+    parts.append("</table>")
+    return "\n".join(parts)
 
 
 def render_flow_html(blocks):
@@ -1795,28 +1849,42 @@ def render_block_markdown(block):
     if block_type == "img":
         return f'![{escape_markdown_image_alt(block["alt"])}]({block["src"]})'
     if block_type == "img_placeholder":
-        caption = escape_markdown(block["caption"]) if block["caption"] else None
-        return f'*[Изображение: {caption}]*' if caption else "*[Изображение]*"
+        return _render_image_placeholder_markdown(block)
     if block_type == "table":
-        def cell(text):
-            # A literal "|" would otherwise be read as a new column
-            # boundary by any Markdown table renderer - on top of the
-            # usual inline escaping, it needs its own explicit escape.
-            return escape_markdown(text).replace("|", "\\|") or " "
-        header, *body = block["rows"]
-        lines = ["| " + " | ".join(cell(c) for c in header) + " |"]
-        lines.append("|" + "|".join(" --- " for _ in header) + "|")
-        for row in body:
-            lines.append("| " + " | ".join(cell(c) for c in row) + " |")
-        return "\n".join(lines)
+        return _render_table_markdown(block)
     if block_type == "code":
-        text = block["text"]
-        # Content inside a fenced code block is taken literally by
-        # CommonMark - no inline escaping needed, and this is what avoids
-        # the raw-HTML-tag risk escape_markdown() exists for elsewhere.
-        fence = "~~~" if "```" in text else "```"
-        return f"{fence}\n{text}\n{fence}"
+        return _render_code_markdown(block)
     raise ValueError(f"unknown block type: {block_type}")
+
+
+def _render_image_placeholder_markdown(block):
+    caption = escape_markdown(block["caption"]) if block["caption"] else None
+    return f'*[Изображение: {caption}]*' if caption else "*[Изображение]*"
+
+
+def _markdown_table_cell(text):
+    # A literal "|" would otherwise be read as a new column boundary by any
+    # Markdown table renderer - on top of the usual inline escaping, it
+    # needs its own explicit escape.
+    return escape_markdown(text).replace("|", "\\|") or " "
+
+
+def _render_table_markdown(block):
+    header, *body = block["rows"]
+    lines = ["| " + " | ".join(_markdown_table_cell(c) for c in header) + " |"]
+    lines.append("|" + "|".join(" --- " for _ in header) + "|")
+    for row in body:
+        lines.append("| " + " | ".join(_markdown_table_cell(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
+def _render_code_markdown(block):
+    text = block["text"]
+    # Content inside a fenced code block is taken literally by CommonMark -
+    # no inline escaping needed, and this is what avoids the raw-HTML-tag
+    # risk escape_markdown() exists for elsewhere.
+    fence = "~~~" if "```" in text else "```"
+    return f"{fence}\n{text}\n{fence}"
 
 
 def render_page_markdown(page_data):
@@ -2153,11 +2221,8 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
         extract_block_raw_text(block) for block in page_dict["blocks"] if block["type"] == 0
     ]
     use_ocr = is_text_garbled(raw_text_blocks)
-
-    blocks = []
-    margin_items = []
-    callout_items = []
-    image_index = 0
+    image_args = (page, page_number, images_dir, save_images, generate_alt,
+                  caption_backend, use_gpu, lmstudio_url, lmstudio_model)
 
     if use_ocr:
         print(
@@ -2165,183 +2230,9 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
             "распознаю текст через OCR...",
             file=sys.stderr,
         )
-        paragraphs, page_height_px, gutter = ocr_page_regions(page, page_dict, use_gpu)
-
-        # Collected as (y0, column, block) instead of appended straight to
-        # `blocks` - embedded images are masked out of the OCR pass and
-        # extracted separately below, and need their own reading-order
-        # position among these paragraphs (see _merge_flow_entries)
-        # instead of always trailing at the very end of the page.
-        flow_entries = []
-        for para in paragraphs:
-            text = para["text"]
-            if not text.strip():
-                continue
-            if is_margin_text(para["y0"], para["y1"], page_height_px, text):
-                margin_items.extend(split_margin_number(text))
-                continue
-            if para["region"] > 0:
-                # A separate column (e.g. a margin callout box) running
-                # alongside the main flow - kept intact as its own block
-                # instead of interleaved line-by-line into the main text.
-                callout_items.append(text)
-                continue
-            if is_numeric_heavy(text):
-                block = {"type": "p_numeric", "text": text}
-            elif para.get("heading_level"):
-                block = {"type": "h", "level": para["heading_level"], "text": text}
-            else:
-                list_item = strip_list_marker(text)
-                if list_item:
-                    item_text, ordered = list_item
-                    block = {"type": "li", "text": item_text, "ordered": ordered}
-                else:
-                    block = {"type": "p", "text": text}
-            block = _with_layout_fields(block, para)
-            flow_entries.append((para["y0"], para.get("column"), block))
-
-        scale = OCR_RENDER_DPI / 72.0
-        image_entries = []
-        for block in page_dict["blocks"]:
-            if block["type"] != 1:
-                continue
-            image_index += 1
-            image_block = extract_image_block(
-                page, block, page_number, image_index, images_dir, save_images,
-                generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
-            )
-            if image_block is None:
-                continue
-            y0_px = block["bbox"][1] * scale
-            column = None
-            if gutter is not None:
-                x0_px = block["bbox"][0] * scale
-                column = 1 if x0_px >= gutter[1] else 0
-                image_block["column"] = column
-            image_entries.append((y0_px, column, image_block))
-
-        blocks.extend(_merge_flow_entries(flow_entries, image_entries))
+        blocks, margin_items, callout_items = _extract_page_blocks_ocr(page, page_dict, use_gpu, image_args)
     else:
-        page_height = page.rect.height
-        body_size = compute_body_font_size(page_dict, page_height)
-        tables = find_page_tables(page, page_dict)
-        link_rects = find_page_links(page)
-        footnote_markers = collect_superscript_digit_markers(page_dict)
-        callout_boxes = [
-            box for box in find_callout_boxes(page, page_dict)
-            if not _region_is_actually_code(box, page_dict)
-        ]
-        emitted_tables = set()
-        next_block_is_code = False
-        for block in page_dict["blocks"]:
-            if block["type"] == 1:
-                # page_dict["blocks"] is produced with sort=True, so
-                # handling an image right here (instead of in a separate
-                # trailing pass) keeps it at its real reading-order
-                # position among the surrounding text - not always
-                # shoved to the bottom of the page, which would break
-                # the association between a figure and its caption.
-                next_block_is_code = False
-                image_index += 1
-                image_block = extract_image_block(
-                    page, block, page_number, image_index, images_dir, save_images,
-                    generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
-                )
-                if image_block is not None:
-                    blocks.append(image_block)
-                continue
-            if block["type"] != 0:
-                continue
-            block_rect = pymupdf.Rect(block["bbox"])
-            block_area = block_rect.width * block_rect.height
-            table_hit_rows = None
-            if block_area > 0:
-                for table_rect, table_rows in tables:
-                    overlap = block_rect & table_rect
-                    if overlap.is_empty:
-                        continue
-                    if (overlap.width * overlap.height) / block_area > TABLE_BLOCK_OVERLAP_MIN_RATIO:
-                        table_hit_rows = table_rows
-                        break
-            if table_hit_rows is not None:
-                next_block_is_code = False
-                if id(table_hit_rows) not in emitted_tables:
-                    emitted_tables.add(id(table_hit_rows))
-                    blocks.append({"type": "table", "rows": table_hit_rows})
-                continue
-
-            # A code listing's own font is usually monospace (Konovalenko);
-            # when it isn't (ci_sharp's subset fonts have no real name to
-            # go by), the block immediately following a "Лістинг/Листинг
-            # N.N" caption is trusted instead - see LISTING_CAPTION_RE
-            # below, which only matches a caption at the very START of a
-            # paragraph (never a mid-sentence mention like "см. листинг 3.2").
-            if is_monospace_font_name(dominant_font_name(block)) or next_block_is_code:
-                next_block_is_code = False
-                code_text = clean_code_text(extract_block_code_raw_text(block))
-                if code_text.strip():
-                    blocks.append({"type": "code", "text": code_text})
-                continue
-
-            in_callout_box = False
-            if block_area > 0:
-                for box in callout_boxes:
-                    overlap = block_rect & box
-                    if overlap.is_empty:
-                        continue
-                    if (overlap.width * overlap.height) / block_area > CALLOUT_BLOCK_OVERLAP_MIN_RATIO:
-                        in_callout_box = True
-                        break
-            if in_callout_box:
-                next_block_is_code = False
-                callout_text = extract_block_text(block)
-                if callout_text.strip():
-                    callout_items.append(callout_text)
-                continue
-
-            list_items = split_block_into_list_items(block)
-            if list_items is not None:
-                next_block_is_code = False
-                for item_text, ordered in list_items:
-                    if not item_text.strip():
-                        continue
-                    if ordered is None:
-                        blocks.append({"type": "p", "text": item_text})
-                    else:
-                        blocks.append({"type": "li", "text": item_text, "ordered": ordered})
-                continue
-
-            text = extract_block_text(block)
-            if not text.strip():
-                continue
-            if is_margin_text(block["bbox"][1], block["bbox"][3], page_height, text):
-                marker_match = FOOTNOTE_MARKER_RE.match(text)
-                is_footnote = bool(marker_match and marker_match.group(1) in footnote_markers)
-                if not is_footnote:
-                    margin_items.extend(split_margin_number(text))
-                    continue
-            if NOTE_LABEL_RE.match(text):
-                callout_items.append(text)
-                continue
-            if LISTING_CAPTION_RE.match(text):
-                next_block_is_code = True
-                blocks.append({"type": "p", "text": text})
-                continue
-            block_size, bold_ratio = block_font_stats(block)
-            level = classify_heading_level(text, block_size, bold_ratio, body_size)
-            if level:
-                blocks.append({"type": "h", "level": level, "text": text})
-            else:
-                list_item = strip_list_marker(text)
-                if list_item:
-                    item_text, ordered = list_item
-                    blocks.append({"type": "li", "text": item_text, "ordered": ordered})
-                else:
-                    p_block = {"type": "p", "text": text}
-                    runs = block_emphasis_runs(block, link_rects)
-                    if runs:
-                        p_block["runs"] = runs
-                    blocks.append(p_block)
+        blocks, margin_items, callout_items = _extract_page_blocks_text(page, page_dict, image_args)
 
     return {
         "page_number": page_number,
@@ -2349,6 +2240,236 @@ def extract_page_blocks(page, page_dict, page_number, images_dir, save_images, g
         "blocks": blocks,
         "callout": callout_items,
     }
+
+
+def _extract_page_blocks_ocr(page, page_dict, use_gpu, image_args):
+    paragraphs, page_height_px, gutter = ocr_page_regions(page, page_dict, use_gpu)
+
+    margin_items = []
+    callout_items = []
+    # Collected as (y0, column, block) instead of appended straight to a
+    # `blocks` list - embedded images are masked out of the OCR pass and
+    # extracted separately below, and need their own reading-order position
+    # among these paragraphs (see _merge_flow_entries) instead of always
+    # trailing at the very end of the page.
+    flow_entries = []
+    for para in paragraphs:
+        text = para["text"]
+        if not text.strip():
+            continue
+        if is_margin_text(para["y0"], para["y1"], page_height_px, text):
+            margin_items.extend(split_margin_number(text))
+            continue
+        if para["region"] > 0:
+            # A separate column (e.g. a margin callout box) running
+            # alongside the main flow - kept intact as its own block
+            # instead of interleaved line-by-line into the main text.
+            callout_items.append(text)
+            continue
+        block = _build_ocr_flow_block(text, para)
+        flow_entries.append((para["y0"], para.get("column"), block))
+
+    image_entries = _extract_ocr_image_entries(page_dict, image_args, gutter)
+    blocks = _merge_flow_entries(flow_entries, image_entries)
+    return blocks, margin_items, callout_items
+
+
+def _build_ocr_flow_block(text, para):
+    if is_numeric_heavy(text):
+        block = {"type": "p_numeric", "text": text}
+    elif para.get("heading_level"):
+        block = {"type": "h", "level": para["heading_level"], "text": text}
+    else:
+        list_item = strip_list_marker(text)
+        if list_item:
+            item_text, ordered = list_item
+            block = {"type": "li", "text": item_text, "ordered": ordered}
+        else:
+            block = {"type": "p", "text": text}
+    return _with_layout_fields(block, para)
+
+
+def _extract_ocr_image_entries(page_dict, image_args, gutter):
+    scale = OCR_RENDER_DPI / 72.0
+    image_index = 0
+    image_entries = []
+    for block in page_dict["blocks"]:
+        if block["type"] != 1:
+            continue
+        image_index += 1
+        image_block = _extract_image_block_for(block, image_index, image_args)
+        if image_block is None:
+            continue
+        y0_px = block["bbox"][1] * scale
+        column = None
+        if gutter is not None:
+            x0_px = block["bbox"][0] * scale
+            column = 1 if x0_px >= gutter[1] else 0
+            image_block["column"] = column
+        image_entries.append((y0_px, column, image_block))
+    return image_entries
+
+
+def _extract_image_block_for(block, image_index, image_args):
+    page, page_number, images_dir, save_images, generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model = image_args
+    return extract_image_block(
+        page, block, page_number, image_index, images_dir, save_images,
+        generate_alt, caption_backend, use_gpu, lmstudio_url, lmstudio_model,
+    )
+
+
+def _extract_page_blocks_text(page, page_dict, image_args):
+    page_height = page.rect.height
+    page_ctx = {
+        "page_height": page_height,
+        "body_size": compute_body_font_size(page_dict, page_height),
+        "tables": find_page_tables(page, page_dict),
+        "link_rects": find_page_links(page),
+        "footnote_markers": collect_superscript_digit_markers(page_dict),
+        "callout_boxes": [
+            box for box in find_callout_boxes(page, page_dict)
+            if not _region_is_actually_code(box, page_dict)
+        ],
+    }
+
+    blocks = []
+    margin_items = []
+    callout_items = []
+    emitted_tables = set()
+    next_block_is_code = False
+    image_index = 0
+    for block in page_dict["blocks"]:
+        if block["type"] == 1:
+            # page_dict["blocks"] is produced with sort=True, so handling an
+            # image right here (instead of in a separate trailing pass)
+            # keeps it at its real reading-order position among the
+            # surrounding text - not always shoved to the bottom of the
+            # page, which would break the association between a figure and
+            # its caption.
+            next_block_is_code = False
+            image_index += 1
+            image_block = _extract_image_block_for(block, image_index, image_args)
+            if image_block is not None:
+                blocks.append(image_block)
+            continue
+        if block["type"] != 0:
+            continue
+        next_block_is_code = _process_text_page_block(
+            block, page_ctx, blocks, margin_items, callout_items, emitted_tables, next_block_is_code,
+        )
+
+    return blocks, margin_items, callout_items
+
+
+def _process_text_page_block(block, page_ctx, blocks, margin_items, callout_items,
+                              emitted_tables, next_block_is_code):
+    """Classifies one text block from the non-OCR extraction path and
+    appends its rendering to `blocks`/`margin_items`/`callout_items` in
+    place. Returns the next value for next_block_is_code (the "block
+    immediately following a listing caption is code" carry-over)."""
+    table_rows = _text_block_table_hit(block, page_ctx["tables"])
+    if table_rows is not None:
+        if id(table_rows) not in emitted_tables:
+            emitted_tables.add(id(table_rows))
+            blocks.append({"type": "table", "rows": table_rows})
+        return False
+
+    # A code listing's own font is usually monospace (Konovalenko); when it
+    # isn't (ci_sharp's subset fonts have no real name to go by), the block
+    # immediately following a "Лістинг/Листинг N.N" caption is trusted
+    # instead - see LISTING_CAPTION_RE below, which only matches a caption
+    # at the very START of a paragraph (never a mid-sentence mention like
+    # "см. листинг 3.2").
+    if is_monospace_font_name(dominant_font_name(block)) or next_block_is_code:
+        code_text = clean_code_text(extract_block_code_raw_text(block))
+        if code_text.strip():
+            blocks.append({"type": "code", "text": code_text})
+        return False
+
+    if _block_in_callout(block, page_ctx["callout_boxes"]):
+        callout_text = extract_block_text(block)
+        if callout_text.strip():
+            callout_items.append(callout_text)
+        return False
+
+    list_items = split_block_into_list_items(block)
+    if list_items is not None:
+        _append_list_items(list_items, blocks)
+        return False
+
+    text = extract_block_text(block)
+    if not text.strip():
+        return False
+    if _consume_as_margin(block, text, page_ctx, margin_items):
+        return False
+    if NOTE_LABEL_RE.match(text):
+        callout_items.append(text)
+        return False
+    if LISTING_CAPTION_RE.match(text):
+        blocks.append({"type": "p", "text": text})
+        return True
+
+    _append_classified_text_block(block, text, page_ctx, blocks)
+    return False
+
+
+def _text_block_table_hit(block, tables):
+    block_rect = pymupdf.Rect(block["bbox"])
+    block_area = block_rect.width * block_rect.height
+    if block_area <= 0:
+        return None
+    for table_rect, table_rows in tables:
+        overlap = block_rect & table_rect
+        if overlap.is_empty:
+            continue
+        if (overlap.width * overlap.height) / block_area > TABLE_BLOCK_OVERLAP_MIN_RATIO:
+            return table_rows
+    return None
+
+
+def _append_list_items(list_items, blocks):
+    for item_text, ordered in list_items:
+        if not item_text.strip():
+            continue
+        if ordered is None:
+            blocks.append({"type": "p", "text": item_text})
+        else:
+            blocks.append({"type": "li", "text": item_text, "ordered": ordered})
+
+
+def _consume_as_margin(block, text, page_ctx, margin_items):
+    """Returns True if `text` was consumed as ordinary margin content (the
+    caller should stop processing this block) - False if it should keep
+    going through the rest of the classification chain (not margin-shaped
+    text at all, or margin-shaped but actually a real footnote whose number
+    matches a real superscript marker on the page - see
+    collect_superscript_digit_markers)."""
+    if not is_margin_text(block["bbox"][1], block["bbox"][3], page_ctx["page_height"], text):
+        return False
+    marker_match = FOOTNOTE_MARKER_RE.match(text)
+    is_footnote = bool(marker_match and marker_match.group(1) in page_ctx["footnote_markers"])
+    if is_footnote:
+        return False
+    margin_items.extend(split_margin_number(text))
+    return True
+
+
+def _append_classified_text_block(block, text, page_ctx, blocks):
+    block_size, bold_ratio = block_font_stats(block)
+    level = classify_heading_level(text, block_size, bold_ratio, page_ctx["body_size"])
+    if level:
+        blocks.append({"type": "h", "level": level, "text": text})
+        return
+    list_item = strip_list_marker(text)
+    if list_item:
+        item_text, ordered = list_item
+        blocks.append({"type": "li", "text": item_text, "ordered": ordered})
+        return
+    p_block = {"type": "p", "text": text}
+    runs = block_emphasis_runs(block, page_ctx["link_rects"])
+    if runs:
+        p_block["runs"] = runs
+    blocks.append(p_block)
 
 
 def state_dir_for(output_dir, input_path):
@@ -2455,6 +2576,11 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
     # image silently overwrite another's on a matching page_number+image_index
     # (see extract_image_block).
     images_dir = output_dir / "images" / input_path.stem
+    if not images_dir.resolve().is_relative_to(output_dir.resolve()):
+        raise SystemExit(
+            f"Некорректное имя входного файла {input_path.name!r}: "
+            f"путь для картинок выходит за пределы {output_dir}"
+        )
     output_dir.mkdir(parents=True, exist_ok=True)
     if save_images:
         images_dir.mkdir(parents=True, exist_ok=True)
@@ -2463,14 +2589,7 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
 
     doc = pymupdf.open(str(input_path))
     page_count = len(doc)
-    if end_page is None:
-        end_page = page_count
-    if not (1 <= start_page <= page_count):
-        doc.close()
-        raise SystemExit(f"--start-page {start_page} вне диапазона (в документе {page_count} стр.)")
-    if not (start_page <= end_page <= page_count):
-        doc.close()
-        raise SystemExit(f"--end-page {end_page} вне диапазона (в документе {page_count} стр.)")
+    end_page = _resolve_page_range(doc, page_count, start_page, end_page)
 
     title = clean_text(doc.metadata.get("title") or "") or input_path.stem
 
@@ -2515,10 +2634,9 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
         fragments[page_number] = page_data
         write_fragment(pages_dir, page_number, page_data)
         pages_since_assemble += 1
-        if not assembled_once or pages_since_assemble >= ASSEMBLE_EVERY_N_PAGES:
-            assemble_output(out_file, title, fragments, out_format)
-            pages_since_assemble = 0
-            assembled_once = True
+        pages_since_assemble, assembled_once = _maybe_assemble_output(
+            out_file, title, fragments, out_format, pages_since_assemble, assembled_once,
+        )
 
         print(f"Обработана страница {page_number}/{page_count}", file=sys.stderr)
 
@@ -2531,19 +2649,42 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
     assemble_output(out_file, title, fragments, out_format)
 
     if clean_state:
-        done_count = sum(1 for n in range(1, page_count + 1) if n in fragments)
-        if done_count == page_count:
-            shutil.rmtree(state_dir, ignore_errors=True)
-            print("Документ сконвертирован полностью - служебная папка состояния удалена.", file=sys.stderr)
-        else:
-            print(
-                f"--clean-state: документ ещё не сконвертирован полностью "
-                f"({done_count}/{page_count} стр.) - папка состояния сохранена "
-                "для последующего продолжения.",
-                file=sys.stderr,
-            )
+        _maybe_clean_state(state_dir, fragments, page_count)
 
     return out_file
+
+
+def _resolve_page_range(doc, page_count, start_page, end_page):
+    if end_page is None:
+        end_page = page_count
+    if not (1 <= start_page <= page_count):
+        doc.close()
+        raise SystemExit(f"--start-page {start_page} вне диапазона (в документе {page_count} стр.)")
+    if not (start_page <= end_page <= page_count):
+        doc.close()
+        raise SystemExit(f"--end-page {end_page} вне диапазона (в документе {page_count} стр.)")
+    return end_page
+
+
+def _maybe_assemble_output(out_file, title, fragments, out_format, pages_since_assemble, assembled_once):
+    if not assembled_once or pages_since_assemble >= ASSEMBLE_EVERY_N_PAGES:
+        assemble_output(out_file, title, fragments, out_format)
+        return 0, True
+    return pages_since_assemble, assembled_once
+
+
+def _maybe_clean_state(state_dir, fragments, page_count):
+    done_count = sum(1 for n in range(1, page_count + 1) if n in fragments)
+    if done_count == page_count:
+        shutil.rmtree(state_dir, ignore_errors=True)
+        print("Документ сконвертирован полностью - служебная папка состояния удалена.", file=sys.stderr)
+    else:
+        print(
+            f"--clean-state: документ ещё не сконвертирован полностью "
+            f"({done_count}/{page_count} стр.) - папка состояния сохранена "
+            "для последующего продолжения.",
+            file=sys.stderr,
+        )
 
 
 def parse_args(argv=None):

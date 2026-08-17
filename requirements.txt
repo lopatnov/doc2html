@@ -3,3 +3,4 @@ Pillow>=12.3.0
 torch>=2.13.0
 easyocr>=1.7
 numpy
+questionary>=2.0  # tools/find_book.py only - interactive book-search wizard
