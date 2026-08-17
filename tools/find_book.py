@@ -21,7 +21,9 @@ Enter to accept the default shown in brackets):
      actually filters on; blank = skip)
   4. Is the author important? -> name/part of name to search for
   5. Do languages matter? -> pick from a list (arrow keys + space)
-  6. Sort by... (popularity / catalog id ascending / catalog id descending)
+  6. Sort by... (popularity / newest-added-to-Gutenberg-first / oldest-first -
+     Gutendex has no real publication-date field, so "newest" here means
+     highest catalog id, i.e. most recently added to the archive)
   7. How many of the N matches do you want? (default: 1)
   8. Pick specific books from the results (arrow keys + space, top N
      pre-checked)
@@ -79,8 +81,8 @@ COMMON_LANGUAGES = [
 # default matching raises ValueError (hit this for real on a live run).
 SORT_CHOICES = [
     ("popular", "по популярности (число скачиваний)"),
-    ("ascending", "по номеру в каталоге Gutenberg, по возрастанию"),
-    ("descending", "по номеру в каталоге Gutenberg, по убыванию"),
+    ("descending", "сначала новые (по номеру в каталоге Gutenberg, по убыванию)"),
+    ("ascending", "сначала старые (по номеру в каталоге Gutenberg, по возрастанию)"),
 ]
 
 
