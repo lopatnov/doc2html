@@ -2338,6 +2338,7 @@ def _extract_page_blocks_text(page, page_dict, image_args):
     emitted_tables = set()
     next_block_is_code = False
     image_index = 0
+    prev_text_bbox = None
     for block in page_dict["blocks"]:
         if block["type"] == 1:
             # page_dict["blocks"] is produced with sort=True, so handling an
@@ -2354,15 +2355,18 @@ def _extract_page_blocks_text(page, page_dict, image_args):
             continue
         if block["type"] != 0:
             continue
+        gap_from_prev = block["bbox"][1] - prev_text_bbox[3] if prev_text_bbox else None
         next_block_is_code = _process_text_page_block(
             block, page_ctx, blocks, margin_items, callout_items, emitted_tables, next_block_is_code,
+            gap_from_prev,
         )
+        prev_text_bbox = block["bbox"]
 
     return blocks, margin_items, callout_items
 
 
 def _process_text_page_block(block, page_ctx, blocks, margin_items, callout_items,
-                              emitted_tables, next_block_is_code):
+                              emitted_tables, next_block_is_code, gap_from_prev):
     """Classifies one text block from the non-OCR extraction path and
     appends its rendering to `blocks`/`margin_items`/`callout_items` in
     place. Returns the next value for next_block_is_code (the "block
@@ -2400,7 +2404,7 @@ def _process_text_page_block(block, page_ctx, blocks, margin_items, callout_item
     text = extract_block_text(block)
     if not text.strip():
         return False
-    if _consume_as_margin(block, text, page_ctx, margin_items):
+    if _consume_as_margin(block, text, page_ctx, margin_items, gap_from_prev):
         return False
     if NOTE_LABEL_RE.match(text):
         callout_items.append(text)
@@ -2437,14 +2441,51 @@ def _append_list_items(list_items, blocks):
             blocks.append({"type": "li", "text": item_text, "ordered": ordered})
 
 
-def _consume_as_margin(block, text, page_ctx, margin_items):
+MARGIN_STRIP_LEADING_CHARS = "“‘'\"([—–- \t"
+
+
+def _margin_text_is_body_continuation(text, gap_from_prev, body_size):
+    """A prose paragraph that happens to end or start right at a page's
+    top/bottom edge looks geometrically identical to a real running
+    head/footer/footnote to is_margin_text's short-text-near-the-edge
+    heuristic - this is especially common with EPUB/MOBI, reflowed by
+    PyMuPDF into fixed-height virtual "pages" that have no real margin
+    concept at all, so a page break can land in the middle of any
+    sentence (found on ~19% of pages of a real Gutenberg epub, e.g.
+    "...cried the Brahmin, and seizing a staff, he was" cut off at the
+    bottom of one page, continuing as "about to strike a gong..." at the
+    top of the next - both landed in "margin" and vanished from the
+    paragraph flow).
+
+    Two independent, cheap signs give it away as ordinary body flow
+    instead of real margin content: a lowercase first letter (a real
+    header/footnote/page-number never starts on a lowercase word -
+    catches a paragraph's first line continuing from the previous page),
+    and a gap from the preceding block on the same page no bigger than
+    normal paragraph spacing (real margin content sits in reserved
+    whitespace, clearly separated from the body column - catches a
+    paragraph's last line right before the page breaks).
+    """
+    stripped = text.lstrip(MARGIN_STRIP_LEADING_CHARS)
+    if stripped[:1].islower():
+        return True
+    if gap_from_prev is None or body_size is None:
+        return False
+    return gap_from_prev <= body_size
+
+
+def _consume_as_margin(block, text, page_ctx, margin_items, gap_from_prev):
     """Returns True if `text` was consumed as ordinary margin content (the
     caller should stop processing this block) - False if it should keep
     going through the rest of the classification chain (not margin-shaped
-    text at all, or margin-shaped but actually a real footnote whose number
+    text at all, margin-shaped but actually a real footnote whose number
     matches a real superscript marker on the page - see
-    collect_superscript_digit_markers)."""
+    collect_superscript_digit_markers -, or margin-shaped but actually an
+    ordinary paragraph cut off by a page break - see
+    _margin_text_is_body_continuation)."""
     if not is_margin_text(block["bbox"][1], block["bbox"][3], page_ctx["page_height"], text):
+        return False
+    if _margin_text_is_body_continuation(text, gap_from_prev, page_ctx["body_size"]):
         return False
     marker_match = FOOTNOTE_MARKER_RE.match(text)
     is_footnote = bool(marker_match and marker_match.group(1) in page_ctx["footnote_markers"])
