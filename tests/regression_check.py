@@ -24,10 +24,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import doc2html
 
 INPUT_DIR = Path(__file__).resolve().parent.parent / "input"
+CORPUS_DIR = Path(__file__).resolve().parent / "fixtures" / "corpus"
 NIELSEN = INPUT_DIR / "Веб-дизайн книга Якоба Нильсена.pdf"
 KONOVALENKO = INPUT_DIR / "Konovalenko I. .NET-C#.pdf"
 NON_DESIGNERS = INPUT_DIR / "Non-Designers-Design-Book.pdf"
 RESUME = INPUT_DIR / "Oleksandr_Lopatnov_Resume.docx"
+MARGIN_CONTINUATION = CORPUS_DIR / "margin_page_break_continuation.pdf"
 
 CHECKS = []
 
@@ -257,6 +259,25 @@ def _(page_data):
     assert sbyte_row is not None, "строка 'sbyte' не найдена в таблице - проверь clean_table_rows"
     assert sbyte_row == ["sbyte", "8-бітове знакове ціле", "-128...127", "System.SByte"], \
         f"строка 'sbyte' расползлась по не тем колонкам: {sbyte_row!r} - проверь _merge_split_columns"
+
+
+@check(MARGIN_CONTINUATION, 1,
+       "абзац, обрезанный переносом страницы, не улетает в margin (сигнал по зазору с предыдущим блоком)")
+def _(page_data):
+    assert page_data["margin"] == [], \
+        f"хвост абзаца ошибочно попал в margin: {page_data['margin']!r}"
+    assert has_block(page_data["blocks"], type="p", text="as he finally caught sight of the distant"), \
+        "хвост абзаца перед разрывом страницы не найден среди обычных блоков"
+
+
+@check(MARGIN_CONTINUATION, 2,
+       "начало абзаца, обрезанного переносом страницы, не улетает в margin (сигнал по строчной букве)")
+def _(page_data):
+    assert page_data["margin"] == [], \
+        f"начало абзаца ошибочно попало в margin: {page_data['margin']!r}"
+    assert has_block(page_data["blocks"], type="p",
+                      text="town, tired but relieved that his journey was finally at an end."), \
+        "продолжение абзаца после разрыва страницы не найдено среди обычных блоков"
 
 
 def _assert_image_namespacing(tmp_dir):
