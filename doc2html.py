@@ -2464,14 +2464,20 @@ def _margin_text_is_body_continuation(text, gap_from_prev, body_size):
     and a gap from the preceding block on the same page no bigger than
     normal paragraph spacing (real margin content sits in reserved
     whitespace, clearly separated from the body column - catches a
-    paragraph's last line right before the page breaks).
+    paragraph's last line right before the page breaks). The gap must
+    also be non-negative: a negative "gap" means this block and the
+    previous one overlap vertically, which happens whenever they sit in
+    different columns rather than one above the other - that's not
+    contiguous body flow at all, so it must not slip through the same
+    check (a real footer/page-number can land right next to a column
+    that happens to run a little lower on the page).
     """
     stripped = text.lstrip(MARGIN_STRIP_LEADING_CHARS)
     if stripped[:1].islower():
         return True
     if gap_from_prev is None or body_size is None:
         return False
-    return gap_from_prev <= body_size
+    return 0 <= gap_from_prev <= body_size
 
 
 def _consume_as_margin(block, text, page_ctx, margin_items, gap_from_prev):

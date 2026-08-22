@@ -280,6 +280,37 @@ def _(page_data):
         "продолжение абзаца после разрыва страницы не найдено среди обычных блоков"
 
 
+def check_negative_gap_guard():
+    """_margin_text_is_body_continuation must not be fooled by a negative
+    gap_from_prev - that happens when the "previous" block in document
+    order sits in a different column whose vertical range overlaps the
+    current one (not stacked above it at all), which a real footer/page
+    number can land right next to. A plain `gap_from_prev <= body_size`
+    check would accept any negative gap too (found by CodeRabbit on the
+    PR for this exact fix) since every negative number is <= a positive
+    body_size. Checked directly against the helper rather than via a
+    rendered PDF: PyMuPDF's own block reconstruction merges two textboxes
+    whose bounding boxes truly overlap into a single block, making a
+    genuine two-separate-overlapping-blocks fixture impractical to force
+    through insert_textbox."""
+    label = "[negative-gap] отрицательный зазор (разные колонки) не пропускает футер/номер страницы в тело"
+    cases = [
+        ("42", -10, 12, False, "футер с отрицательным зазором (разные колонки) не должен уйти в тело"),
+        ("Page 3", -1, 12, False, "номер страницы с отрицательным зазором не должен уйти в тело"),
+        ("continued from before", 3, 12, True, "обычный маленький положительный зазор по-прежнему считается продолжением"),
+        ("continued from before", -10, 12, True, "строчная буква перевешивает зазор в любую сторону"),
+    ]
+    failed = False
+    for text, gap, body_size, expected, msg in cases:
+        actual = doc2html._margin_text_is_body_continuation(text, gap, body_size)
+        if actual != expected:
+            print(f"ОШИБКА  {label}: {msg} (text={text!r} gap={gap} -> {actual}, ожидал {expected})")
+            failed = True
+    if not failed:
+        print(f"OK      {label}")
+    return not failed
+
+
 def _assert_image_namespacing(tmp_dir):
     """Runs the actual checks and raises AssertionError on failure. Uses
     explicit `raise` rather than `assert` so the checks still fire under
@@ -398,6 +429,10 @@ def main():
             ran += 1
             if not namespacing_result:
                 failed += 1
+
+        ran += 1
+        if not check_negative_gap_guard():
+            failed += 1
 
         print(f"\n{ran - failed}/{ran} проверок пройдено" + (f" ({skipped} пропущено - книга недоступна)" if skipped else ""))
         return 1 if failed else 0
