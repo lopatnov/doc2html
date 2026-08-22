@@ -1,0 +1,14 @@
+{
+  "source": "Project Gutenberg (via gutendex.com API)",
+  "gutenberg_id": 70300,
+  "gutenberg_book_url": "https://www.gutenberg.org/ebooks/70300",
+  "title": "Legendary & romantic tales of Indian history",
+  "authors": [
+    "Caunter, Hobart"
+  ],
+  "license_basis": "Gutendex reports copyright=false for this book (public domain in the US); the downloaded file is also covered by the Project Gutenberg License, see https://www.gutenberg.org/policy/license.html",
+  "format_mime": "application/epub+zip",
+  "format_url": "https://www.gutenberg.org/ebooks/70300.epub3.images",
+  "local_file": "gutenberg_70300.epub",
+  "attempt": 2
+}
