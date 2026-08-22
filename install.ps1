@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 
 function Invoke-Step {
     param([string]$Description, [scriptblock]$Action)
-    Write-Host $Description
+    Write-Output $Description
     & $Action
     if ($LASTEXITCODE -ne 0) {
         throw "Шаг завершился с ошибкой: $Description"
