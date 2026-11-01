@@ -269,7 +269,7 @@ class OcrLanguageTests(unittest.TestCase):
                 )
             self.assertIn("--ocr-lang", other.getvalue())
 
-    def test_convert_document_applies_and_records_the_languages(self):
+    def test_convert_document_records_the_chosen_languages(self):
         with tempfile.TemporaryDirectory() as tmp:
             pdf_path = Path(tmp) / "tiny.pdf"
             doc = pymupdf.open()
@@ -278,10 +278,10 @@ class OcrLanguageTests(unittest.TestCase):
             doc.close()
 
             out_dir = Path(tmp) / "out"
+            doc2html.set_ocr_languages(["es", "en"])
             with contextlib.redirect_stderr(io.StringIO()):
                 doc2html.convert_document(
-                    pdf_path, out_dir, generate_alt=False, use_gpu=False,
-                    clean_state=False, ocr_languages=["es", "en"],
+                    pdf_path, out_dir, generate_alt=False, use_gpu=False, clean_state=False,
                 )
             self.assertEqual(doc2html._ocr_languages, ["es", "en"])
             meta = json.loads((out_dir / ".tiny.doc2html-state" / "meta.json").read_text(encoding="utf-8"))

@@ -236,8 +236,9 @@ def parse_ocr_languages(raw):
 
 
 def set_ocr_languages(languages):
-    """Choose the languages the OCR model is loaded with; a model already
-    loaded for other languages is dropped and reloaded on next use."""
+    """Choose the languages the OCR model is loaded with (call before
+    convert_document, which records them in the resume settings); a model
+    already loaded for other languages is dropped and reloaded on next use."""
     global _ocr_languages, _ocr_reader
     languages = list(languages)
     if languages != _ocr_languages:
@@ -2669,46 +2670,52 @@ def state_dir_for(output_dir, input_path):
     return output_dir / f".{input_path.stem}.doc2html-state"
 
 
+def _check_existing_state(state_dir, meta_path, doc_identity, current_settings):
+    """Refuse a checkpoint that belongs to another document; just print a
+    note if only the settings it was written with differ."""
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        meta = None
+    if not meta or meta.get("identity") != doc_identity:
+        raise SystemExit(
+            f"Папка состояния {state_dir.name} относится к другому файлу "
+            "(другой путь, размер или дата изменения). Укажите другую папку "
+            "-o для этого документа."
+        )
+    previous_settings = meta.get("last_settings")
+    if previous_settings:
+        # State written before --ocr-lang existed used the built-in default.
+        previous_settings = {"ocr_languages": list(DEFAULT_OCR_LANGUAGES), **previous_settings}
+    if previous_settings and previous_settings != current_settings:
+        print(
+            "Обратите внимание: --save-images/--generate-alt/--ocr-lang отличаются от "
+            f"предыдущего запуска (было: {previous_settings}, сейчас: "
+            f"{current_settings}). Уже готовые страницы сохранят прежнее "
+            "содержимое - новыми настройками будут обработаны только страницы, "
+            "которых ещё нет в кеше. Чтобы пересчитать уже готовые страницы "
+            "текущего диапазона новыми настройками, используйте --restart.",
+            file=sys.stderr,
+        )
+
+
 def load_or_init_state(state_dir, doc_identity, current_settings, restart, start_page, end_page):
     """Set up (or validate/resume) the per-page checkpoint directory.
 
     Only the source document's *identity* (path/size/mtime) is a hard gate -
     mixing fragments from two different documents would be silent data
-    corruption. --save-images/--generate-alt are allowed to change between
-    invocations (that's how you convert a document in chunks with different
-    settings per chunk, or add captions to a later range); a mismatch there
-    just prints an informational note, since already-written fragments
-    simply keep whatever content they were extracted with.
+    corruption. --save-images/--generate-alt/--ocr-lang are allowed to change
+    between invocations (that's how you convert a document in chunks with
+    different settings per chunk, or add captions to a later range); a
+    mismatch there just prints an informational note, since already-written
+    fragments simply keep whatever content they were extracted with.
     """
     meta_path = state_dir / "meta.json"
     pages_dir = state_dir / "pages"
     pages_dir.mkdir(parents=True, exist_ok=True)
 
     if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            meta = None
-        if not meta or meta.get("identity") != doc_identity:
-            raise SystemExit(
-                f"Папка состояния {state_dir.name} относится к другому файлу "
-                "(другой путь, размер или дата изменения). Укажите другую папку "
-                "-o для этого документа."
-            )
-        previous_settings = meta.get("last_settings")
-        if previous_settings:
-            # State written before --ocr-lang existed used the built-in default.
-            previous_settings = {"ocr_languages": list(DEFAULT_OCR_LANGUAGES), **previous_settings}
-        if previous_settings and previous_settings != current_settings:
-            print(
-                "Обратите внимание: --save-images/--generate-alt/--ocr-lang отличаются от "
-                f"предыдущего запуска (было: {previous_settings}, сейчас: "
-                f"{current_settings}). Уже готовые страницы сохранят прежнее "
-                "содержимое - новыми настройками будут обработаны только страницы, "
-                "которых ещё нет в кеше. Чтобы пересчитать уже готовые страницы "
-                "текущего диапазона новыми настройками, используйте --restart.",
-                file=sys.stderr,
-            )
+        _check_existing_state(state_dir, meta_path, doc_identity, current_settings)
 
     if restart:
         for page_number in range(start_page, end_page + 1):
@@ -2765,9 +2772,7 @@ def assemble_output(out_file, title, fragments, out_format):
 def convert_document(input_path, output_dir, save_images=True, generate_alt=True,
                       start_page=1, end_page=None, restart=False, clean_state=True,
                       caption_backend="blip", use_gpu=None, out_format="html",
-                      lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None,
-                      ocr_languages=DEFAULT_OCR_LANGUAGES):
-    set_ocr_languages(ocr_languages)
+                      lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
     output_dir = Path(output_dir)
     # Scoped per book (not a flat shared images/), so converting two
     # different books into the same -o directory can't have one book's
@@ -2800,7 +2805,7 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
     current_settings = {
         "save_images": save_images,
         "generate_alt": generate_alt,
-        "ocr_languages": list(ocr_languages),
+        "ocr_languages": list(_ocr_languages),
     }
     state_dir = state_dir_for(output_dir, input_path)
     pages_dir = load_or_init_state(state_dir, doc_identity, current_settings, restart, start_page, end_page)
@@ -3007,6 +3012,7 @@ def main(argv=None):
             print(f"Ошибка: {message}", file=sys.stderr)
             return 1
 
+    set_ocr_languages(args.ocr_lang)
     out_file = convert_document(
         input_path,
         args.output_dir,
@@ -3021,7 +3027,6 @@ def main(argv=None):
         out_format=args.out_format,
         lmstudio_url=args.lmstudio_url,
         lmstudio_model=args.lmstudio_model,
-        ocr_languages=args.ocr_lang,
     )
     print(f"Готово: {out_file}")
     return 0
