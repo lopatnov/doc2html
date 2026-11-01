@@ -41,7 +41,11 @@ jobs:
         # install can pull in a newer, compromised release or run an
         # arbitrary setup.py build script (both flagged by SonarCloud on
         # the previous version of this line).
-        run: pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
+        # A block scalar on purpose: ": " inside a plain "run: ..." value is a
+        # YAML mapping indicator, which made GitHub reject this whole file
+        # (every run failed with zero jobs from 2026-08-17 until this fix).
+        run: |
+          pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
 
       - name: Compile-check every Python file
         run: python -m compileall -q .
