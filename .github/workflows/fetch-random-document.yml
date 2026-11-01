@@ -14,6 +14,12 @@ on:
         description: "Max random Gutenberg IDs to try before giving up"
         required: false
         default: "20"
+      source:
+        description: "Catalog to ask: auto (Gutendex, falling back to the gutenberg.org record) or just one of them"
+        required: false
+        type: choice
+        options: [auto, gutendex, rdf]
+        default: auto
 
 jobs:
   fetch:
@@ -36,7 +42,8 @@ jobs:
       - name: Fetch a random public-domain document
         env:
           MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts }}
-        run: python3 tools/fetch_random_doc.py --max-attempts "${MAX_ATTEMPTS:-20}"
+          SOURCE: ${{ github.event.inputs.source }}
+        run: python3 tools/fetch_random_doc.py --max-attempts "${MAX_ATTEMPTS:-20}" --source "${SOURCE:-auto}"
 
       - name: Publish to a run-specific inbox branch
         env:

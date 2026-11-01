@@ -76,10 +76,14 @@ def read_capped(resp, max_bytes=MAX_RESPONSE_BYTES):
     return b"".join(chunks)
 
 
-def fetch_json(opener, url, timeout=15):
+def fetch_bytes(opener, url, timeout=15, max_bytes=MAX_RESPONSE_BYTES):
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with opener.open(req, timeout=timeout) as resp:
-        return json.loads(read_capped(resp))
+        return read_capped(resp, max_bytes)
+
+
+def fetch_json(opener, url, timeout=15):
+    return json.loads(fetch_bytes(opener, url, timeout))
 
 
 def is_allowed_download_url(url, allowed_hosts):

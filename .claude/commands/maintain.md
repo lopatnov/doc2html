@@ -43,6 +43,15 @@ Gutenberg через API Gutendex, оставляет только те, где 
 времени вызова этого workflow не могут перезаписать результат друг друга — раньше была
 именно эта проблема). Старые inbox-ветки раннер сам подчищает после публикации своей.
 
+Источников два, и они независимы: Gutendex (`copyright: false`) и каталожная
+запись самого gutenberg.org (`pg<id>.rdf`, права «Public domain in the USA.»).
+Gutendex пробуется первым; если он не отвечает, для того же id спрашивается
+gutenberg.org, а после 3 неудач подряд Gutendex пропускается до конца запуска
+(он уже выпадал на недели: 100% таймаутов, пока gutenberg.org отвечал за
+миллисекунды). Входной параметр workflow `source` (`auto`/`gutendex`/`rdf`)
+позволяет закрепить один из них; по умолчанию `auto`. Какой каталог ответил —
+видно в `metadata.json` (поле `source`).
+
 Вызов из session:
 1. `mcp__github__actions_run_trigger` (`method: run_workflow`, `workflow_id:
    fetch-random-document.yml`, `ref: main`).
