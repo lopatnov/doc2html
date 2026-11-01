@@ -6,11 +6,16 @@ and is skipped almost entirely in CI), everything here runs everywhere.
 
 Run: python -m unittest discover -s tests -p "test_*.py"
 """
+import contextlib
+import io
+import json
 import re
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 from urllib.parse import unquote
 
 import pymupdf
@@ -159,6 +164,128 @@ class ImagePathTests(unittest.TestCase):
     def test_markdown_title_is_escaped(self):
         doc = doc2html.build_markdown_document("<noframes> *x*", ["page"])
         self.assertTrue(doc.startswith("# \\<noframes\\> \\*x\\*\n"))
+
+
+class OcrLanguageTests(unittest.TestCase):
+    def setUp(self):
+        self.addCleanup(self.restore_defaults)
+
+    @staticmethod
+    def restore_defaults():
+        doc2html.set_ocr_languages(doc2html.DEFAULT_OCR_LANGUAGES)
+        doc2html._ocr_reader = None
+
+    @staticmethod
+    def fake_easyocr(reader_cls):
+        return mock.patch.dict(sys.modules, {"easyocr": types.SimpleNamespace(Reader=reader_cls)})
+
+    def test_parse_accepts_easyocr_codes(self):
+        self.assertEqual(doc2html.parse_ocr_languages("es,en"), ["es", "en"])
+        self.assertEqual(doc2html.parse_ocr_languages(" ES , en,es "), ["es", "en"])
+        self.assertEqual(doc2html.parse_ocr_languages("ch_sim,en"), ["ch_sim", "en"])
+        self.assertEqual(doc2html.parse_ocr_languages("uk"), ["uk"])
+
+    def test_parse_rejects_things_that_are_not_codes(self):
+        for raw in ("english", "e", "ru;en", "ru en", "", " , ", "ru,en,русский"):
+            with self.assertRaises(doc2html.argparse.ArgumentTypeError, msg=raw):
+                doc2html.parse_ocr_languages(raw)
+
+    def test_command_line(self):
+        self.assertEqual(doc2html.parse_args(["book.pdf"]).ocr_lang, ["ru", "en"])
+        self.assertEqual(doc2html.parse_args(["book.pdf", "--ocr-lang", "de,en"]).ocr_lang, ["de", "en"])
+        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit):
+            doc2html.parse_args(["book.pdf", "--ocr-lang", "english"])
+        self.assertIn("--ocr-lang", err.getvalue())
+
+    def test_reader_is_created_for_the_chosen_languages_and_cached(self):
+        created = []
+
+        class FakeReader:
+            def __init__(self, languages, gpu):
+                created.append((list(languages), gpu))
+
+        with self.fake_easyocr(FakeReader), contextlib.redirect_stderr(io.StringIO()):
+            doc2html.set_ocr_languages(["es", "en"])
+            first = doc2html.get_ocr_reader(False)
+            self.assertIs(doc2html.get_ocr_reader(False), first)
+            doc2html.set_ocr_languages(["es", "en"])
+            self.assertIs(doc2html.get_ocr_reader(False), first)
+            doc2html.set_ocr_languages(["de", "en"])
+            self.assertIsNot(doc2html.get_ocr_reader(False), first)
+        self.assertEqual(created, [(["es", "en"], False), (["de", "en"], False)])
+
+    def test_easyocr_rejecting_the_languages_is_a_clear_exit(self):
+        class RejectingReader:
+            def __init__(self, languages, gpu):
+                raise ValueError("Russian is only compatible with English, try again.")
+
+        with self.fake_easyocr(RejectingReader), contextlib.redirect_stderr(io.StringIO()):
+            doc2html.set_ocr_languages(["ru", "es"])
+            with self.assertRaises(SystemExit) as ctx:
+                doc2html.get_ocr_reader(False)
+        message = str(ctx.exception)
+        self.assertIn("ru,es", message)
+        self.assertIn("only compatible with English", message)
+        self.assertIsNone(doc2html._ocr_reader)
+
+    def test_resume_notice_when_the_languages_change(self):
+        identity = {"input_path": "x", "input_size": 1, "input_mtime": 1.0}
+        settings = {"save_images": True, "generate_alt": False, "ocr_languages": ["ru", "en"]}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            quiet = io.StringIO()
+            with contextlib.redirect_stderr(quiet):
+                doc2html.load_or_init_state(state_dir, identity, settings, False, 1, 1)
+                doc2html.load_or_init_state(state_dir, identity, settings, False, 1, 1)
+            self.assertEqual(quiet.getvalue(), "")
+
+            noisy = io.StringIO()
+            with contextlib.redirect_stderr(noisy):
+                doc2html.load_or_init_state(state_dir, identity, {**settings, "ocr_languages": ["es", "en"]}, False, 1, 1)
+            self.assertIn("--ocr-lang", noisy.getvalue())
+
+    def test_state_from_before_the_option_counts_as_the_default_languages(self):
+        identity = {"input_path": "x", "input_size": 1, "input_mtime": 1.0}
+        with tempfile.TemporaryDirectory() as tmp:
+            state_dir = Path(tmp) / "state"
+            (state_dir / "pages").mkdir(parents=True)
+            legacy = {"identity": identity, "last_settings": {"save_images": True, "generate_alt": False}}
+            (state_dir / "meta.json").write_text(json.dumps(legacy), encoding="utf-8")
+
+            same = io.StringIO()
+            with contextlib.redirect_stderr(same):
+                doc2html.load_or_init_state(
+                    state_dir, identity, {"save_images": True, "generate_alt": False, "ocr_languages": ["ru", "en"]},
+                    False, 1, 1,
+                )
+            self.assertEqual(same.getvalue(), "")
+
+            (state_dir / "meta.json").write_text(json.dumps(legacy), encoding="utf-8")
+            other = io.StringIO()
+            with contextlib.redirect_stderr(other):
+                doc2html.load_or_init_state(
+                    state_dir, identity, {"save_images": True, "generate_alt": False, "ocr_languages": ["es", "en"]},
+                    False, 1, 1,
+                )
+            self.assertIn("--ocr-lang", other.getvalue())
+
+    def test_convert_document_applies_and_records_the_languages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf_path = Path(tmp) / "tiny.pdf"
+            doc = pymupdf.open()
+            doc.new_page().insert_text((72, 100), "Hello there, this is a tiny page.", fontsize=11)
+            doc.save(str(pdf_path))
+            doc.close()
+
+            out_dir = Path(tmp) / "out"
+            with contextlib.redirect_stderr(io.StringIO()):
+                doc2html.convert_document(
+                    pdf_path, out_dir, generate_alt=False, use_gpu=False,
+                    clean_state=False, ocr_languages=["es", "en"],
+                )
+            self.assertEqual(doc2html._ocr_languages, ["es", "en"])
+            meta = json.loads((out_dir / ".tiny.doc2html-state" / "meta.json").read_text(encoding="utf-8"))
+            self.assertEqual(meta["last_settings"]["ocr_languages"], ["es", "en"])
 
 
 class EndToEndTests(unittest.TestCase):

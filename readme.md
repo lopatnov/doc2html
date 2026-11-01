@@ -19,8 +19,9 @@ It addresses the typical problems of "naive" converters:
   font ToUnicode table is broken (the text layer is unreadable in
   principle — glyphs map to control characters rather than letters), the
   script detects this automatically and recognizes that page through
-  offline OCR (EasyOCR, ru+en) instead of the broken text layer. The
-  result is always valid UTF-8.
+  offline OCR (EasyOCR; Russian and English by default, other languages
+  via `--ocr-lang`) instead of the broken text layer. The result is
+  always valid UTF-8.
 - **Images.** Embedded images are rendered as-is (taking
   orientation/transformations into account — otherwise an image can come
   out flipped or mirrored), saved into an `images/<book name>/`
@@ -103,7 +104,7 @@ Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
 This creates a conda environment named **`doc2html`** and installs the
 base dependencies from `requirements.txt` (PyMuPDF, Pillow, torch,
 easyocr) — enough for conversion without captions (the default) or with
-`--generate-alt lmstudio`. The EasyOCR model (ru+en, ~100 MB) is
+`--generate-alt lmstudio`. The EasyOCR model (Russian and English by default, ~100 MB) is
 downloaded once, on first use.
 
 The offline caption backend `--generate-alt blip` requires the
@@ -157,6 +158,7 @@ python doc2html.py input\example.pdf -o output
 | `--restart`                          | off                        | Ignore saved state (within the requested range) and start over                             |
 | `--clean-state` / `--no-clean-state` | **on**                     | Delete the state folder once the whole document is fully done                              |
 | `--gpu` / `--no-gpu`                 | auto-detect                | Use the GPU (CUDA) for OCR/BLIP                                                            |
+| `--ocr-lang CODES`                   | `ru,en`                    | Languages of the OCR fallback, EasyOCR codes separated by commas (see below)               |
 | `--lmstudio-url`                     | `http://localhost:1234/v1` | LM Studio server address                                                                   |
 | `--lmstudio-model`                   | `lfm2.5-vl-450m`           | Vision model name in LM Studio (used with `--generate-alt lmstudio`)                       |
 
@@ -247,6 +249,32 @@ a different `--out-format` later and don't want to lose the cache
 prematurely). You can delete the state folder manually at any time —
 you won't lose images, only the ability to resume/finish converting
 without recomputation.
+
+### OCR languages
+
+OCR runs only for pages whose text layer is unusable (see "Encodings" above);
+it reads Russian and English unless told otherwise. For a document in another
+language pass its [EasyOCR language codes](https://www.jaided.ai/easyocr/),
+separated by commas, the primary language first:
+
+```powershell
+python doc2html.py input\libro.pdf -o output --ocr-lang es,en
+python doc2html.py input\buch.pdf -o output --ocr-lang de,en
+python doc2html.py input\kniga.pdf -o output --ocr-lang uk,en
+```
+
+EasyOCR accepts only some combinations: a Cyrillic language (`ru`, `uk`, `bg`,
+...) can be paired with English and other Cyrillic languages only, a
+Latin-script one (`es`, `de`, `fr`, `pl`, ...) with English and other
+Latin-script ones. Keep `en` in the list to read digits and Latin words inside
+the text. If EasyOCR refuses the list (unknown code, impossible pair) the
+script stops with its message; pages that are already done are kept, so just
+run it again with another value. The model for each language is downloaded
+once, on first use.
+
+Changing `--ocr-lang` between runs of the same output folder prints the same
+notice as changing `--save-images`/`--generate-alt`: finished pages keep the
+text they were recognized with, and `--restart` redoes the requested range.
 
 ### GPU and LM Studio
 

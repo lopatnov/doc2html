@@ -33,7 +33,12 @@ from xml.etree import ElementTree
 import pymupdf
 
 CAPTION_MODEL_NAME = "Salesforce/blip-image-captioning-base"
-OCR_LANGUAGES = ["ru", "en"]
+# EasyOCR language codes used when a page's text layer is unusable (--ocr-lang).
+# Not every pair is allowed: Cyrillic languages combine only with English and
+# other Cyrillic ones, Latin-script languages with English and other Latin
+# ones - EasyOCR itself rejects the rest when the model is loaded.
+DEFAULT_OCR_LANGUAGES = ("ru", "en")
+OCR_LANGUAGE_CODE_RE = re.compile(r"[a-z]{2,3}(?:_[a-z]+)?")
 OCR_RENDER_DPI = 300
 IMAGE_RENDER_DPI = 200
 # convert_document(): re-rendering and rewriting the WHOLE output file after
@@ -205,6 +210,39 @@ _caption_model = None
 _caption_processor = None
 _caption_device = "cpu"
 _ocr_reader = None
+_ocr_languages = list(DEFAULT_OCR_LANGUAGES)
+
+
+def parse_ocr_languages(raw):
+    """"es,en" -> ["es", "en"]: EasyOCR codes, lowercase, no duplicates, order
+    kept (the first one is the primary language). Only the shape of each code
+    is checked here, so a typo fails at the command line; whether EasyOCR
+    knows the code and accepts the combination is decided when the model is
+    loaded (see get_ocr_reader)."""
+    codes = []
+    for part in str(raw).split(","):
+        code = part.strip().lower()
+        if not code:
+            continue
+        if not OCR_LANGUAGE_CODE_RE.fullmatch(code):
+            raise argparse.ArgumentTypeError(
+                f"{part.strip()!r} не похоже на код языка EasyOCR (примеры: ru, en, es, de, uk, ch_sim)"
+            )
+        if code not in codes:
+            codes.append(code)
+    if not codes:
+        raise argparse.ArgumentTypeError("укажите хотя бы один язык, например: ru,en")
+    return codes
+
+
+def set_ocr_languages(languages):
+    """Choose the languages the OCR model is loaded with; a model already
+    loaded for other languages is dropped and reloaded on next use."""
+    global _ocr_languages, _ocr_reader
+    languages = list(languages)
+    if languages != _ocr_languages:
+        _ocr_languages = languages
+        _ocr_reader = None
 
 
 def resolve_use_gpu(preference):
@@ -361,11 +399,19 @@ def get_ocr_reader(use_gpu):
         import easyocr
 
         print(
-            f"Loading OCR model for languages {OCR_LANGUAGES} (gpu={use_gpu}) "
+            f"Loading OCR model for languages {_ocr_languages} (gpu={use_gpu}) "
             "(first run downloads the weights)...",
             file=sys.stderr,
         )
-        _ocr_reader = easyocr.Reader(OCR_LANGUAGES, gpu=use_gpu)
+        try:
+            _ocr_reader = easyocr.Reader(_ocr_languages, gpu=use_gpu)
+        except ValueError as exc:
+            raise SystemExit(
+                f"EasyOCR не принимает языки {','.join(_ocr_languages)}: {exc}. "
+                "Нужны коды EasyOCR, совместимые между собой (кириллические языки "
+                "сочетаются только с английским, латиница - со своими и английским); "
+                "уже готовые страницы сохранены, можно запустить заново с другим --ocr-lang."
+            ) from exc
     return _ocr_reader
 
 
@@ -2650,9 +2696,12 @@ def load_or_init_state(state_dir, doc_identity, current_settings, restart, start
                 "-o для этого документа."
             )
         previous_settings = meta.get("last_settings")
+        if previous_settings:
+            # State written before --ocr-lang existed used the built-in default.
+            previous_settings = {"ocr_languages": list(DEFAULT_OCR_LANGUAGES), **previous_settings}
         if previous_settings and previous_settings != current_settings:
             print(
-                "Обратите внимание: --save-images/--generate-alt отличаются от "
+                "Обратите внимание: --save-images/--generate-alt/--ocr-lang отличаются от "
                 f"предыдущего запуска (было: {previous_settings}, сейчас: "
                 f"{current_settings}). Уже готовые страницы сохранят прежнее "
                 "содержимое - новыми настройками будут обработаны только страницы, "
@@ -2716,7 +2765,9 @@ def assemble_output(out_file, title, fragments, out_format):
 def convert_document(input_path, output_dir, save_images=True, generate_alt=True,
                       start_page=1, end_page=None, restart=False, clean_state=True,
                       caption_backend="blip", use_gpu=None, out_format="html",
-                      lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None):
+                      lmstudio_url=LMSTUDIO_DEFAULT_URL, lmstudio_model=None,
+                      ocr_languages=DEFAULT_OCR_LANGUAGES):
+    set_ocr_languages(ocr_languages)
     output_dir = Path(output_dir)
     # Scoped per book (not a flat shared images/), so converting two
     # different books into the same -o directory can't have one book's
@@ -2746,7 +2797,11 @@ def convert_document(input_path, output_dir, save_images=True, generate_alt=True
         "input_size": stat.st_size,
         "input_mtime": stat.st_mtime,
     }
-    current_settings = {"save_images": save_images, "generate_alt": generate_alt}
+    current_settings = {
+        "save_images": save_images,
+        "generate_alt": generate_alt,
+        "ocr_languages": list(ocr_languages),
+    }
     state_dir = state_dir_for(output_dir, input_path)
     pages_dir = load_or_init_state(state_dir, doc_identity, current_settings, restart, start_page, end_page)
     fragments = read_existing_fragments(pages_dir, page_count)
@@ -2904,6 +2959,16 @@ def parse_args(argv=None):
         help="Принудительно использовать CPU (по умолчанию: автоопределение через torch.cuda)",
     )
     parser.add_argument(
+        "--ocr-lang", type=parse_ocr_languages, default=",".join(DEFAULT_OCR_LANGUAGES),
+        metavar="CODES",
+        help=(
+            "Языки OCR (коды EasyOCR через запятую), нужны только для страниц с "
+            "неисправным текстовым слоем. Совместимость: кириллические языки "
+            "сочетаются только с английским, латиница - со своими и английским "
+            "(например es,en или de,en). По умолчанию: %(default)s"
+        ),
+    )
+    parser.add_argument(
         "--lmstudio-url", default=LMSTUDIO_DEFAULT_URL,
         help=f"Базовый URL OpenAI-совместимого сервера LM Studio (по умолчанию: {LMSTUDIO_DEFAULT_URL})",
     )
@@ -2956,6 +3021,7 @@ def main(argv=None):
         out_format=args.out_format,
         lmstudio_url=args.lmstudio_url,
         lmstudio_model=args.lmstudio_model,
+        ocr_languages=args.ocr_lang,
     )
     print(f"Готово: {out_file}")
     return 0
