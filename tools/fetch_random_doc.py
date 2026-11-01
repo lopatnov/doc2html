@@ -36,6 +36,15 @@ MAX_GUTENBERG_ID = 75000
 # fetching an arbitrary URL (SSRF).
 ALLOWED_DOWNLOAD_HOSTS = {"www.gutenberg.org", "gutenberg.org"}
 
+# GitHub hard-rejects any single pushed file over 100 MiB (confirmed on a
+# real run: a 133.43 MB epub was fetched fine but "Publish to a run-specific
+# inbox branch" failed with "GH001: Large files detected", since the file
+# is committed and pushed via plain git, not Git LFS). Capped well under
+# that so an oversized candidate fails inside try_fetch_book's own
+# except-and-skip, the same as any other bad candidate, instead of reaching
+# git push and failing the whole run.
+MAX_PUBLISHABLE_FILE_BYTES = 95 * 1024 * 1024
+
 _API_OPENER = gutenberg_http.build_opener({"gutendex.com"})
 _DOWNLOAD_OPENER = gutenberg_http.build_opener(ALLOWED_DOWNLOAD_HOSTS)
 
@@ -114,7 +123,7 @@ def try_fetch_book(book_id, attempt, out_dir):
 
     dest = out_dir / f"gutenberg_{book_id}{gutenberg_http.EXTENSION_BY_MIME_PREFIX[mime_prefix]}"
     try:
-        gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest)
+        gutenberg_http.atomic_download(_DOWNLOAD_OPENER, url, dest, max_bytes=MAX_PUBLISHABLE_FILE_BYTES)
     except Exception as exc:
         print(f"attempt {attempt}: download failed for id {book_id}: {exc}", file=sys.stderr)
         return False

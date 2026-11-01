@@ -102,7 +102,7 @@ def normalize_download_url(url, allowed_hosts):
     return url
 
 
-def atomic_download(opener, url, dest, timeout=60):
+def atomic_download(opener, url, dest, timeout=60, max_bytes=MAX_RESPONSE_BYTES):
     """Write to a temp file and rename into place only once the full body
     is on disk, so a failed attempt (network error, disk full mid-write)
     never leaves a partial/empty file at dest for a caller to pick up and
@@ -110,7 +110,7 @@ def atomic_download(opener, url, dest, timeout=60):
     """
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     with opener.open(req, timeout=timeout) as resp:
-        data = read_capped(resp)
+        data = read_capped(resp, max_bytes)
     # A fixed ".{name}.part" temp name would collide if two downloads to the
     # same dest ever ran concurrently - mkstemp gives each call its own file.
     fd, temp_name = tempfile.mkstemp(prefix=f".{dest.name}.", suffix=".part", dir=str(dest.parent))
