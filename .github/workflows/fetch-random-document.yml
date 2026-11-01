@@ -33,24 +33,6 @@ jobs:
         with:
           python-version: "3.x"
 
-      - name: DIAGNOSTIC - network reachability
-        # Temporary, not meant to stay: 5 consecutive biweekly /maintain runs
-        # (2026-10-02 through 2026-10-31) have failed with 20/20 Gutendex API
-        # calls hitting "read operation timed out", identically every time.
-        # This checks whether that's specific to gutendex.com (outage, or
-        # GitHub-runner-IP throttling on their end) or whether GitHub Actions'
-        # own egress has become restricted in general (would affect every
-        # external host, not just gutendex.com).
-        run: |
-          set +e
-          for url in https://gutendex.com/books/1 https://www.gutenberg.org https://pypi.org https://www.google.com; do
-            echo "=== $url ==="
-            time curl -sS -m 12 -o /dev/null -w "http_code=%{http_code} time_namelookup=%{time_namelookup} time_connect=%{time_connect} time_appconnect=%{time_appconnect} time_starttransfer=%{time_starttransfer} time_total=%{time_total}\n" "$url"
-            echo "exit=$?"
-            echo
-          done
-          set -e
-
       - name: Fetch a random public-domain document
         env:
           MAX_ATTEMPTS: ${{ github.event.inputs.max_attempts }}
