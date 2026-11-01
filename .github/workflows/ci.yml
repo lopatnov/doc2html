@@ -33,7 +33,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.x"
+          # The version install.ps1 creates the conda env with. "3.x" floats to
+          # the newest CPython, which by now has no wheels for the exact
+          # versions pinned below (numpy==2.4.6 stops at 3.14).
+          python-version: "3.11"
 
       - name: Install lightweight dependencies
         # Pinned exact versions + --only-binary :all: so pip only ever
@@ -41,7 +44,11 @@ jobs:
         # install can pull in a newer, compromised release or run an
         # arbitrary setup.py build script (both flagged by SonarCloud on
         # the previous version of this line).
-        run: pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
+        # A block scalar on purpose: ": " inside a plain "run: ..." value is a
+        # YAML mapping indicator, which made GitHub reject this whole file
+        # (every run failed with zero jobs from 2026-08-17 until this fix).
+        run: |
+          pip install --only-binary :all: pymupdf==1.28.2 Pillow==12.3.0 numpy==2.4.6 questionary==2.1.1
 
       - name: Compile-check every Python file
         run: python -m compileall -q .
@@ -50,6 +57,11 @@ jobs:
         run: |
           cd tools
           python -c "import find_book, fetch_random_doc, gutenberg_http, audit_pages"
+
+      - name: Run unit tests
+        # No real books and no OCR model needed: pure functions plus an
+        # end-to-end conversion of a tiny PDF built on the fly.
+        run: python -m unittest discover -s tests -p "test_*.py"
 
       - name: Run regression harness
         # Real book fixtures live in input/ (gitignored) - checks against a
