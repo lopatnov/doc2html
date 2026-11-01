@@ -33,7 +33,10 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: "3.x"
+          # The version install.ps1 creates the conda env with. "3.x" floats to
+          # the newest CPython, which by now has no wheels for the exact
+          # versions pinned below (numpy==2.4.6 stops at 3.14).
+          python-version: "3.11"
 
       - name: Install lightweight dependencies
         # Pinned exact versions + --only-binary :all: so pip only ever
