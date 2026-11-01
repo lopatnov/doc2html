@@ -65,11 +65,11 @@ MAX_RDF_BYTES = 2 * 1024 * 1024
 # of the run (each failure costs a full request timeout).
 GUTENDEX_MAX_CONSECUTIVE_FAILURES = 3
 
-RDF_NS = {
-    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
-    "dcterms": "http://purl.org/dc/terms/",
-    "pgterms": "http://www.gutenberg.org/2009/pgterms/",
-}
+# XML namespace identifiers of the catalog record, in ElementTree's {uri}tag
+# notation. They must match the document byte for byte and are never fetched.
+RDF = "{http://www.w3.org/1999/02/22-rdf-syntax-ns#}"
+DCTERMS = "{http://purl.org/dc/terms/}"
+PGTERMS = "{http://www.gutenberg.org/2009/pgterms/}"
 
 _API_OPENER = gutenberg_http.build_opener({"gutendex.com"})
 _DOWNLOAD_OPENER = gutenberg_http.build_opener(ALLOWED_DOWNLOAD_HOSTS)
@@ -123,33 +123,33 @@ def parse_gutenberg_rdf(raw, book_id):
     pgterms:ebook element at all - a format change should be visible in the
     log, not silently skip every id."""
     root = ElementTree.fromstring(raw)
-    ebook = root.find("pgterms:ebook", RDF_NS)
+    ebook = root.find(f"{PGTERMS}ebook")
     if ebook is None:
         raise ValueError("catalog record has no pgterms:ebook element")
-    rights = (ebook.findtext("dcterms:rights", default="", namespaces=RDF_NS)).strip()
+    rights = ebook.findtext(f"{DCTERMS}rights", default="").strip()
     if not rights.lower().startswith("public domain"):
         return None
 
     # One book usually has several files per mime type (epub3 / epub with
     # images / epub without images): keep the most complete one.
     best = {}
-    for file_el in ebook.iterfind("dcterms:hasFormat/pgterms:file", RDF_NS):
-        url = file_el.get(f"{{{RDF_NS['rdf']}}}about")
+    for file_el in ebook.iterfind(f"{DCTERMS}hasFormat/{PGTERMS}file"):
+        url = file_el.get(f"{RDF}about")
         if not url:
             continue
         rank = (".images" in url, "epub3" in url)
-        for value in file_el.iterfind("dcterms:format/rdf:Description/rdf:value", RDF_NS):
+        for value in file_el.iterfind(f"{DCTERMS}format/{RDF}Description/{RDF}value"):
             mime = (value.text or "").strip()
             if mime and (mime not in best or rank > best[mime][0]):
                 best[mime] = (rank, url)
 
     authors = [
         (name.text or "").strip()
-        for name in ebook.iterfind("dcterms:creator/pgterms:agent/pgterms:name", RDF_NS)
+        for name in ebook.iterfind(f"{DCTERMS}creator/{PGTERMS}agent/{PGTERMS}name")
     ]
     return {
         "source": "Project Gutenberg (catalog record on gutenberg.org)",
-        "title": ebook.findtext("dcterms:title", default=None, namespaces=RDF_NS),
+        "title": ebook.findtext(f"{DCTERMS}title"),
         "authors": [a for a in authors if a],
         "formats": {mime: url for mime, (_rank, url) in best.items()},
         "license_basis": (

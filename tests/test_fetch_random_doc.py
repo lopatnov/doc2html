@@ -11,6 +11,7 @@ import unittest
 import urllib.error
 from pathlib import Path
 from unittest import mock
+from xml.etree import ElementTree
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tools"))
 import fetch_random_doc as frd
@@ -117,7 +118,7 @@ class ParseRdfTests(unittest.TestCase):
         raw = b'<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"/>'
         with self.assertRaises(ValueError):
             frd.parse_gutenberg_rdf(raw, 1)
-        with self.assertRaises(Exception):
+        with self.assertRaises(ElementTree.ParseError):
             frd.parse_gutenberg_rdf(b"<html>not xml", 1)
 
     def test_picked_format_prefers_epub(self):
