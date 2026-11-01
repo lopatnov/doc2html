@@ -51,6 +51,11 @@ jobs:
           cd tools
           python -c "import find_book, fetch_random_doc, gutenberg_http, audit_pages"
 
+      - name: Run unit tests
+        # No real books and no OCR model needed: pure functions plus an
+        # end-to-end conversion of a tiny PDF built on the fly.
+        run: python -m unittest discover -s tests -p "test_*.py"
+
       - name: Run regression harness
         # Real book fixtures live in input/ (gitignored) - checks against a
         # missing book skip cleanly instead of failing, so this still

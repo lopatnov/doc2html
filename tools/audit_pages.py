@@ -87,12 +87,13 @@ def source_truth_tokens(page, page_dict, use_gpu):
             x0, y0, x1, y1 = block["bbox"]
             draw.rectangle([x0 * scale, y0 * scale, x1 * scale, y1 * scale], fill="white")
     raw_results = reader.readtext(np.array(image), detail=1, paragraph=False)
-    text = " ".join(t.strip() for _bbox, t, _conf in raw_results if t.strip())
-    # Without this, a hyphenated line-wrap ("стра- ницы") tokenizes as two
-    # half-word fragments that can never match the real pipeline's already
-    # dehyphenated "страницы" token, producing systematic false "missing
-    # word" hits on every OCR page.
-    text = doc2html.clean_text(text)
+    # Without unwrapping, a hyphenated line-wrap ("стра-" / "ницы") tokenizes
+    # as two half-word fragments that can never match the real pipeline's
+    # already dehyphenated "страницы" token, producing systematic false
+    # "missing word" hits on every OCR page.
+    text = doc2html.clean_text(
+        doc2html.join_wrapped_lines([t.strip() for _bbox, t, _conf in raw_results if t.strip()])
+    )
     return tokenize(text), True
 
 

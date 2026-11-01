@@ -61,10 +61,37 @@ NUMERIC_PARAGRAPH_MIN_CHARS = 4
 LMSTUDIO_DEFAULT_URL = "http://localhost:1234/v1"
 LMSTUDIO_TIMEOUT = 120
 
-# A hyphen at a line-wrap point ("бо-\nлее" -> extracted as "бо- лее") should
-# collapse back into one word ("более"). Requires a letter on both sides so we
-# don't touch numeric ranges ("2020-2021") or list markers.
-HYPHEN_WRAP_RE = re.compile(r"(?<=[A-Za-zА-Яа-яЁё])-\s+(?=[A-Za-zА-Яа-яЁё])")
+
+
+def is_wrap_hyphen_break(prev_line, next_line):
+    """True if prev_line ends in a hyphen right after a letter and next_line
+    continues in lowercase - i.e. a word wrapped across the line break."""
+    head = prev_line.rstrip()
+    return len(head) >= 2 and head[-1] == "-" and head[-2].isalpha() and next_line.lstrip()[:1].islower()
+
+
+def join_wrapped_lines(lines):
+    """Join the lines of one paragraph with single spaces, except that a
+    hyphen at a line-wrap point ("бо-" + "лее") collapses back into one word
+    ("более"): the previous line must end with a letter plus "-" and the next
+    one must continue in lowercase.
+
+    This is decided from the line boundary, not by pattern-matching the
+    already-joined text: a mid-line "two- and three-dimensional" or
+    "научно- и технический" (a suspended hyphen) is indistinguishable from a
+    wrapped word once the line breaks are gone, and used to lose its hyphen
+    and glue the words together ("twoand", "научнои").
+    """
+    result = ""
+    for line in lines:
+        if not result:
+            result = line
+            continue
+        if is_wrap_hyphen_break(result, line):
+            result = result.rstrip()[:-1] + line.lstrip()
+        else:
+            result += " " + line
+    return result
 
 # --- OCR layout reconstruction tuning ---
 # Two raw OCR detections are the same printed row if their y-ranges overlap
@@ -717,7 +744,7 @@ def reflow_rows_into_paragraphs(rows):
             or strip_list_marker(row["text"]) is not None
         )
         if gap <= gap_threshold and not prev_finished and not next_starts_new_entry:
-            current_text = prev_text + " " + row["text"]
+            current_text = join_wrapped_lines([prev_text, row["text"]])
             current["y1"] = row["y1"]
             current["x1"] = max(current["x1"], row["x1"])
             current_is_heading_run = current_is_heading_run and row_continues_heading
@@ -1152,18 +1179,17 @@ def clean_text(text):
     something is often a Private-Use-Area codepoint with no real meaning
     (renders as tofu boxes) - those are stripped. Ligatures and other
     compatibility characters are folded to their plain equivalents via
-    NFKC. Hyphenated line-wraps ("бо- лее") are rejoined into whole words.
+    NFKC. Hyphenated line-wraps are rejoined earlier, where the line breaks
+    are still known (see join_wrapped_lines).
     """
     if not text:
         return ""
     text = unicodedata.normalize("NFKC", text)
-    text = "".join(
+    return "".join(
         ch for ch in text
         if not (0xE000 <= ord(ch) <= 0xF8FF)
         and not (ord(ch) < 0x20 and ch not in "\n\t")
     )
-    text = HYPHEN_WRAP_RE.sub("", text)
-    return text
 
 
 def extract_block_raw_text(block):
@@ -1172,7 +1198,7 @@ def extract_block_raw_text(block):
         line_text = "".join(span.get("text", "") for span in line.get("spans", []))
         if line_text.strip():
             lines.append(line_text)
-    return " ".join(lines)
+    return join_wrapped_lines(lines)
 
 
 def extract_block_text(block):
@@ -1210,18 +1236,27 @@ def extract_block_runs(block, link_rects=None):
     text()'s plain string, just with style/link info preserved alongside
     instead of discarded. link_rects (see find_page_links) is optional -
     without it every run's href is None."""
-    kept_lines = [
-        line for line in block.get("lines", [])
-        if "".join(s.get("text", "") for s in line.get("spans", [])).strip()
-    ]
+    kept_lines = []
+    for line in block.get("lines", []):
+        line_text = "".join(s.get("text", "") for s in line.get("spans", []))
+        if line_text.strip():
+            kept_lines.append((line, line_text))
     raw_runs = []
-    for i, line in enumerate(kept_lines):
-        if i > 0:
+    prev_line_text = None
+    for line, line_text in kept_lines:
+        unwrap = prev_line_text is not None and is_wrap_hyphen_break(prev_line_text, line_text)
+        if unwrap:
+            _drop_trailing_wrap_hyphen(raw_runs)
+        elif prev_line_text is not None:
             raw_runs.append([" ", False, False, False, None])
+        prev_line_text = line_text
         for span in line.get("spans", []):
             text = span.get("text", "")
+            if unwrap:
+                text = text.lstrip()
             if not text:
                 continue
+            unwrap = False
             flags = span.get("flags", 0)
             href = _span_href(span, link_rects)
             raw_runs.append([text, bool(flags & 2 ** 4), bool(flags & 2), bool(flags & 1), href])
@@ -1241,15 +1276,26 @@ def extract_block_runs(block, link_rects=None):
     return merged
 
 
+def _drop_trailing_wrap_hyphen(raw_runs):
+    """Remove the line-wrap hyphen (and any trailing blanks after it) from
+    the end of raw_runs, so the next line's first run continues the word."""
+    while raw_runs and not raw_runs[-1][0].strip():
+        raw_runs.pop()
+    if raw_runs:
+        raw_runs[-1][0] = raw_runs[-1][0].rstrip()[:-1]
+        if not raw_runs[-1][0]:
+            raw_runs.pop()
+
+
 def block_emphasis_runs(block, link_rects=None):
     """None for a uniformly-plain, unlinked block (the common case - not
     worth the extra JSON/render-time work), or a list of {"text", "bold",
     "italic", "superscript", "href"} runs when the block genuinely mixes/
     contains bold/italic/superscript spans or overlaps a real PDF link -
     each run's text cleaned the same way clean_code_text() cleans a code
-    line (NFKC + strip PUA/control), skipping HYPHEN_WRAP_RE since a
-    hyphen at a style-run boundary is rare and unwrapping across runs
-    would need cross-run lookahead this function deliberately doesn't do.
+    line (NFKC + strip PUA/control). Wrapped-word hyphens are already
+    resolved by extract_block_runs, at the same line boundaries
+    extract_block_raw_text uses.
     """
     runs = extract_block_runs(block, link_rects)
     if not any(bold or italic or superscript or href for _, bold, italic, superscript, href in runs):
@@ -1272,7 +1318,7 @@ MONOSPACE_FONT_HINTS = ("courier", "consolas", "mono", "menlo", "cascadia", "rob
 
 def clean_code_text(text):
     """Like clean_text(), but for a code block: preserves newlines/leading
-    whitespace (indentation IS the content) and skips HYPHEN_WRAP_RE - a
+    whitespace (indentation IS the content) and never unwraps hyphens - a
     stray "-\\n" in code is far more likely a real hyphen/operator at a
     line break than a hyphenated word wrap, and rejoining it would corrupt
     the code."""
@@ -1433,10 +1479,57 @@ BARE_URL_RE = re.compile(r"(https?://[^\s<>\"'«»]+|www\.[^\s<>\"'«»]+\.[a-zA
 
 
 def _linkify_url_target(matched):
-    url = matched.rstrip(").,;:!?»")
+    # Trailing sentence punctuation is not part of the URL; a closing
+    # parenthesis is only dropped when it has no opening one inside the URL
+    # (a Wikipedia-style ".../Foo_(bar)" keeps its own).
+    url = matched
+    while url and (url[-1] in ".,;:!?»" or (url[-1] == ")" and url.count(")") > url.count("("))):
+        url = url[:-1]
     trailing = matched[len(url):]
     href = url if url.startswith("http") else f"https://{url}"
     return url, href, trailing
+
+
+# Link targets come straight from the document (PDF link annotations, .docx
+# relationships), i.e. from whoever wrote it - a "javascript:" or "data:" URI
+# must never turn into a clickable link in the converted output.
+SAFE_URL_SCHEMES = {"http", "https", "mailto", "tel"}
+URL_SCHEME_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):")
+MARKDOWN_HREF_UNSAFE_RE = re.compile(r"[\x00-\x20\x7f()<>\\]")
+
+
+def safe_href(href):
+    """href unchanged if it is safe to emit as a clickable link (an allowed
+    scheme, or a scheme-less relative/"#page-N" target), else None. Blanks and
+    control characters are ignored when looking for the scheme, because
+    browsers ignore them too ("java<TAB>script:" still runs as javascript:)."""
+    if not href:
+        return None
+    match = URL_SCHEME_RE.match(re.sub(r"[\x00-\x20]", "", href))
+    if match and match.group(1).lower() not in SAFE_URL_SCHEMES:
+        return None
+    return href
+
+
+def escape_markdown_href(href):
+    """Percent-encode the characters that would end or break a Markdown
+    link destination (blanks, parentheses, angle brackets, backslash)."""
+    return MARKDOWN_HREF_UNSAFE_RE.sub(lambda m: f"%{ord(m.group()):02X}", href)
+
+
+def url_path(path):
+    """Percent-encode a relative file path for use as an HTML src / Markdown
+    image destination. Readable non-ASCII characters are kept as they are; a
+    book called "My #Book (1)" otherwise breaks the URL at the "#" (HTML) or
+    at the first blank (Markdown)."""
+    out = []
+    for ch in path:
+        if ch.isascii():
+            keep = ch.isalnum() or ch in "/._~-"
+        else:
+            keep = ch.isprintable() and not ch.isspace()
+        out.append(ch if keep else "".join(f"%{b:02X}" for b in ch.encode("utf-8")))
+    return "".join(out)
 
 
 def linkify_html(text):
@@ -1459,7 +1552,7 @@ def linkify_markdown(text):
         if m.start() > pos:
             parts.append(escape_markdown_inline(text[pos:m.start()]))
         url, href, trailing = _linkify_url_target(m.group(0))
-        parts.append(f"[{url}]({href})")
+        parts.append(f"[{escape_markdown_inline(url)}]({escape_markdown_href(href)})")
         parts.append(escape_markdown_inline(trailing))
         pos = m.end()
     parts.append(escape_markdown_inline(text[pos:]))
@@ -1591,7 +1684,7 @@ def render_runs_html(runs):
             text = f"<em>{text}</em>"
         if run.get("superscript"):
             text = f"<sup>{text}</sup>"
-        href = run.get("href")
+        href = safe_href(run.get("href"))
         if href:
             text = f'<a href="{escape(href)}">{text}</a>'
         parts.append(text)
@@ -1606,7 +1699,7 @@ def render_block_html(block):
         level = block["level"]
         return f"<h{level}>{escape(block['text'])}</h{level}>"
     if block_type == "img":
-        return f'<img src="{block["src"]}" alt="{escape(block["alt"])}" loading="lazy">'
+        return f'<img src="{escape(url_path(block["src"]))}" alt="{escape(block["alt"])}" loading="lazy">'
     if block_type == "img_placeholder":
         return _render_image_placeholder_html(block)
     if block_type == "table":
@@ -1828,9 +1921,9 @@ def render_runs_markdown(runs):
             text = f"**{text}**"
         elif run["italic"]:
             text = f"*{text}*"
-        href = run.get("href")
+        href = safe_href(run.get("href"))
         if href:
-            text = f"[{text}]({href})"
+            text = f"[{text}]({escape_markdown_href(href)})"
         parts.append(text)
     return escape_markdown_leading_guard("".join(parts))
 
@@ -1847,7 +1940,7 @@ def render_block_markdown(block):
         marker = "1." if block.get("ordered") else "-"
         return f"{marker} {linkify_markdown(block['text'])}"
     if block_type == "img":
-        return f'![{escape_markdown_image_alt(block["alt"])}]({block["src"]})'
+        return f'![{escape_markdown_image_alt(block["alt"])}]({url_path(block["src"])})'
     if block_type == "img_placeholder":
         return _render_image_placeholder_markdown(block)
     if block_type == "table":
@@ -1900,7 +1993,7 @@ def render_page_markdown(page_data):
 
 def build_markdown_document(title, page_mds):
     body = "\n\n---\n\n".join(page_mds)
-    return f"# {title}\n\n{body}\n"
+    return f"# {escape_markdown(title)}\n\n{body}\n"
 
 
 def render_block_txt(block):
@@ -2011,7 +2104,7 @@ def clean_table_rows(raw_rows):
 
     rows = [
         [
-            "" if is_empty(row[c]) else clean_text(str(row[c])).replace("\n", " ").strip()
+            "" if is_empty(row[c]) else join_wrapped_lines(clean_text(str(row[c])).split("\n")).strip()
             for c in kept_columns
         ]
         for row in padded
@@ -2171,14 +2264,14 @@ def split_block_into_list_items(block):
 
     chunks = []
     if marker_at[0] > 0:
-        intro = " ".join(t for t in line_texts[:marker_at[0]] if t.strip())
+        intro = join_wrapped_lines([t for t in line_texts[:marker_at[0]] if t.strip()])
         if intro.strip():
             chunks.append((intro, None))
     for idx, start in enumerate(marker_at):
         end = marker_at[idx + 1] if idx + 1 < len(marker_at) else len(line_texts)
         item_text, ordered = strip_list_marker(line_texts[start].strip())
-        rest = " ".join(t for t in line_texts[start + 1:end] if t.strip())
-        full_text = f"{item_text} {rest}".strip() if rest else item_text
+        rest = join_wrapped_lines([t for t in line_texts[start + 1:end] if t.strip()])
+        full_text = join_wrapped_lines([item_text, rest]).strip() if rest else item_text
         chunks.append((full_text, ordered))
     return chunks
 
