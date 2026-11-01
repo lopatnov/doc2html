@@ -1228,52 +1228,59 @@ def _span_href(span, link_rects):
     return None
 
 
+def _line_runs(line, link_rects, strip_leading):
+    """[text, bold, italic, superscript, href] for each non-empty span of one
+    line; strip_leading drops the blanks at the start of the line (the
+    continuation of a word wrapped across lines)."""
+    runs = []
+    for span in line.get("spans", []):
+        text = span.get("text", "")
+        if strip_leading:
+            text = text.lstrip()
+        if not text:
+            continue
+        strip_leading = False
+        flags = span.get("flags", 0)
+        runs.append([text, bool(flags & 2 ** 4), bool(flags & 2), bool(flags & 1), _span_href(span, link_rects)])
+    return runs
+
+
+def _merge_adjacent_runs(raw_runs):
+    merged = []
+    for text, bold, italic, superscript, href in raw_runs:
+        if merged and merged[-1][1:] == [bold, italic, superscript, href]:
+            merged[-1][0] += text
+        else:
+            merged.append([text, bold, italic, superscript, href])
+    return merged
+
+
 def extract_block_runs(block, link_rects=None):
     """Per-span (text, bold, italic, href) runs for a block, adjacent runs
     of identical style+link merged - mirrors extract_block_raw_text's line
     filtering/joining exactly (same non-blank lines, same " " between
-    them) so the concatenation of these runs' text matches extract_block_
-    text()'s plain string, just with style/link info preserved alongside
-    instead of discarded. link_rects (see find_page_links) is optional -
-    without it every run's href is None."""
-    kept_lines = []
-    for line in block.get("lines", []):
-        line_text = "".join(s.get("text", "") for s in line.get("spans", []))
-        if line_text.strip():
-            kept_lines.append((line, line_text))
+    them, same unwrapping of a word hyphenated across lines) so the
+    concatenation of these runs' text matches extract_block_text()'s plain
+    string, just with style/link info preserved alongside instead of
+    discarded. link_rects (see find_page_links) is optional - without it
+    every run's href is None."""
+    lines = [
+        (line, "".join(s.get("text", "") for s in line.get("spans", [])))
+        for line in block.get("lines", [])
+    ]
     raw_runs = []
     prev_line_text = None
-    for line, line_text in kept_lines:
+    for line, line_text in lines:
+        if not line_text.strip():
+            continue
         unwrap = prev_line_text is not None and is_wrap_hyphen_break(prev_line_text, line_text)
         if unwrap:
             _drop_trailing_wrap_hyphen(raw_runs)
         elif prev_line_text is not None:
             raw_runs.append([" ", False, False, False, None])
         prev_line_text = line_text
-        for span in line.get("spans", []):
-            text = span.get("text", "")
-            if unwrap:
-                text = text.lstrip()
-            if not text:
-                continue
-            unwrap = False
-            flags = span.get("flags", 0)
-            href = _span_href(span, link_rects)
-            raw_runs.append([text, bool(flags & 2 ** 4), bool(flags & 2), bool(flags & 1), href])
-
-    merged = []
-    for text, bold, italic, superscript, href in raw_runs:
-        if (
-            merged
-            and merged[-1][1] == bold
-            and merged[-1][2] == italic
-            and merged[-1][3] == superscript
-            and merged[-1][4] == href
-        ):
-            merged[-1][0] += text
-        else:
-            merged.append([text, bold, italic, superscript, href])
-    return merged
+        raw_runs.extend(_line_runs(line, link_rects, strip_leading=unwrap))
+    return _merge_adjacent_runs(raw_runs)
 
 
 def _drop_trailing_wrap_hyphen(raw_runs):
