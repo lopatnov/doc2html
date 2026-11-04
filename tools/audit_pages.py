@@ -239,9 +239,14 @@ def main():
     parser.add_argument("--end-page", type=int, default=None)
     parser.add_argument("--top", type=int, default=30, help="how many worst pages to print (default: 30)")
     parser.add_argument("--gpu", action="store_true")
+    parser.add_argument(
+        "--ocr-lang", type=doc2html.parse_ocr_languages, default=",".join(doc2html.DEFAULT_OCR_LANGUAGES),
+        metavar="CODES", help="OCR languages, as for doc2html.py (default: %(default)s)",
+    )
     parser.add_argument("--report", default=None, help="write full JSON findings here (default: <output-dir>/audit_findings.json)")
     args = parser.parse_args()
 
+    doc2html.set_ocr_languages(args.ocr_lang)
     input_path = Path(args.input_file)
     output_dir = Path(args.output_dir)
     if not input_path.is_file():
